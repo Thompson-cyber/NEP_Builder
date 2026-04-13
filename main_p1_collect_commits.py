@@ -8,8 +8,6 @@ from filters.benchmark_filters import BenchmarkFilter
 from mining.miner import RepoMiner
 
 
-# from mining.miner import RepoMiner
-# from filters.benchmark_filters import BenchmarkFilter
 
 def main():
     parser = argparse.ArgumentParser(description="NEP Benchmark Builder - Phase 1 (Revised)")
@@ -20,7 +18,6 @@ def main():
 
     args = parser.parse_args()
 
-    # 只需要一个综合过滤器
     filters = [BenchmarkFilter()]
 
     miner = RepoMiner(args.repo_name,args.repo, filters)
@@ -34,8 +31,6 @@ def main():
     try:
         with open(args.output, 'w', encoding='utf-8') as f:
             for candidate in miner.mine(limit=args.limit):
-                # Pydantic v2 使用 model_dump_json()
-                # 如果是 v1 版本，请使用 .json()
                 f.write(candidate.model_dump_json() + "\n")
                 count += 1
                 logger.info(

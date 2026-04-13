@@ -9,38 +9,7 @@ from core.types import AnalyzedCommit
 from core.llm_ranker import LLMCausalRanker, CausalDatasetExporter
 from config.settings import MiningConfig
 
-ALLOWED_HASH_PREFIXES = {
-    "9d59e8ea",
-    "1813b4a8",
-    "dcf05103",
-    "72a60497",
-    "363c6330",
-    "c0657ce6",
-    "46060fed",
-    "f0121b7b",
-    "bc02bd52",
-    "6252f99c",
-    "aae87002",
-    "86acf454",
-    "f19ff9c5",
-    "aa680bc4",
-    "7baa11e9",
-    "e1ec2cf3",
-    "18a13f2c",
-    "9f03c03f",
-    "bdc5df95",
-    "01c8e0be",
-    "6231e1ed",
-    "c0c504d1",
-}
 
-
-def is_allowed(hash_val: str) -> bool:
-    """判断 hash 是否以允许的前缀开头（不区分大小写）"""
-    if not hash_val:
-        return False
-    h = hash_val.lower()
-    return any(h.startswith(prefix) for prefix in ALLOWED_HASH_PREFIXES)
 
 def main():
     parser = argparse.ArgumentParser(description="Phase 2b: LLM Causal Ranking")
@@ -89,15 +58,10 @@ def main():
 
                 try:
                     data = json.loads(line)
-                    hash_val = data.get("hash", "")
-                    # if not is_allowed(hash_val):
-                    #     continue
-                    # 反序列化为对象
                     commit = AnalyzedCommit(**data)
 
-                    # 检查是否已经包含 ranking (断点续传的简单逻辑)
+                    # 检查是否已经包含 ranking
                     if commit.causal_analysis:
-                        # 如果上一步已经有结果了，直接写出
                         f_out.write(line)
                         stats["success"] += 1
                         continue
