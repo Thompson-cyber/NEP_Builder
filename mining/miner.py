@@ -17,10 +17,13 @@ class RepoMiner:
         self.config = MiningConfig()
 
     def mine(self ) -> Iterator[CommitCandidate]:
-        repo = Repository(self.repo_path, order='reverse',only_no_merge=False)
+        # repo = Repository(self.repo_path, order='reverse',only_no_merge=False)
+        repo = Repository(self.repo_path,only_no_merge=False)
 
         count = 0
         for commit in repo.traverse_commits():
+
+            logger.info(f"[miner]:{commit.hash}")
             if commit.merge:
                 # print(f"Commit {commit.hash} 是合并提交，通常没有 modified_files {len(commit.modified_files)}")
                 pass

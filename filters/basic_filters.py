@@ -15,7 +15,7 @@ class RelevantCodeFilter(BaseFilter):
     """
     核心过滤器：决定一个 Commit 是否值得保留。
     逻辑：
-    1. 必须包含至少一个 .py 文件修改。
+    1. 必须包含至少一个 源代码 文件修改。
     2. 该文件不能在忽略列表 (IGNORE_FILES) 中。
     3. 如果 REQUIRE_TEST_CHANGE 为 True，则还必须包含测试文件。
     """

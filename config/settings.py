@@ -5,10 +5,10 @@ load_dotenv()
 class MiningConfig:
     # --- 阈值设置 (仅针对 Source Files) ---
     # --- 源文件扩展名 ---
-    SOURCE_EXTENSIONS = [".py", ".java", ".ts"]  # 添加 Java 和 TypeScript
+    SOURCE_EXTENSIONS = [".py", ".java", ".ts",".tsx",".go",".js",".cjs",".mjs",".jsx"]
 
     # --- 测试文件模式 ---
-    TEST_FILE_PATTERNS = ["test_", "_test.py", "tests/","tests", ".spec.ts", ".test.ts"]  # 添加 Java 和 TS 测试文件模式
+    TEST_FILE_PATTERNS = ["test","test_", "_test.py", "tests/","tests", ".spec.ts", ".test.ts"]  # 添加 Java 和 TS 测试文件模式
     FLAG = 'Multi'
     if FLAG == 'Single':
         MIN_SOURCE_LOC = 1  # 至少改了5行功能代码
