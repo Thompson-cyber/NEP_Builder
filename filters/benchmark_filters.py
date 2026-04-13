@@ -70,7 +70,7 @@ class BenchmarkFilter(BaseFilter):
                     is_test = True
                     has_test = True
                     test_files_count += 1
-                    # break
+                    break
 
             # 判定是否为有效源码文件
             if any(fname.endswith(ext) for ext in config.SOURCE_EXTENSIONS) and not is_test:

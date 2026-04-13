@@ -8,21 +8,19 @@ from filters.benchmark_filters import BenchmarkFilter
 from mining.miner import RepoMiner
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description="NEP Pipeline — Phase 1: Commit Mining")
+    p.add_argument("--repo",      required=True,  help="Local path or remote URL of the git repository")
+    p.add_argument("--repo_name", required=True,  help="Short identifier for the repository (e.g. 'pandas')")
+    p.add_argument("--output",    default="output/candidates.jsonl", help="Output JSONL file path")
+    p.add_argument("--limit",     type=int, default=100,             help="Max number of candidates to collect")
+    return p.parse_args()
 
 def main():
-    parser = argparse.ArgumentParser(description="NEP Benchmark Builder - Phase 1 (Revised)")
-    parser.add_argument("--repo", type=str, required=True, help="Local path or URL")
-    parser.add_argument("--repo_name", type=str, required=True, help="Local path or URL")
-    parser.add_argument("--output", type=str, default="output/benchmark_candidates_single.jsonl")
-    parser.add_argument("--limit", type=int, default=100)
+    args = parse_args()
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
-    args = parser.parse_args()
-
-    filters = [BenchmarkFilter()]
-
-    miner = RepoMiner(args.repo_name,args.repo, filters)
-    if os.path.dirname(args.output):
-        os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    miner = RepoMiner(args.repo_name,args.repo, [BenchmarkFilter()])
 
     logger.info(f"Starting Benchmark Mining on {args.repo}")
     logger.info("Strategy: Merge Commits | Source (Data) + Test (Verifier)")

@@ -11,15 +11,17 @@ from config.settings import MiningConfig
 
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description="NEP Pipeline — Phase 3: LLM Causal Ranking")
+    p.add_argument("--input",     required=True,  help="Phase 2 output (analyzed.jsonl)")
+    p.add_argument("--old_format_output", required=True, help="Old format dataset output path (.jsonl)")
+    p.add_argument("--output",    required=True,  help="Final dataset output path (.jsonl)")
+    p.add_argument("--error_log", default="output/llm_failures.jsonl", help="Path for failed items")
+    return p.parse_args()
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Phase 2b: LLM Causal Ranking")
-    parser.add_argument("--input", type=str, default=r"D:\Data\2025\CodeCompletion\Dataset\Outputs\Phase2\extracted_by_hash.jsonl",
-                        help="Path to Static Analysis output (intermediate/static_analyzed.jsonl)")
-    parser.add_argument("--output", type=str, default=r"D:\Data\2025\CodeCompletion\Dataset\Outputs\Phase2\extracted_by_hash_selected_test_cases.jsonl", help="Final output path")
-    parser.add_argument("--error_log", type=str, default="output/sklearn/llm_failures.jsonl",
-                        help="Path to save failed items")
-    exporter = CausalDatasetExporter(output_file=r"D:\Data\2025\CodeCompletion\Dataset\Outputs\Phase2\test_json.jsonl")
-    args = parser.parse_args()
+    args   = parse_args()
 
     # 初始化配置和 Ranker
     config = MiningConfig()
@@ -29,11 +31,13 @@ def main():
 
     try:
         ranker = LLMCausalRanker(config)
+        exporter = CausalDatasetExporter(output_file=args.output)
+
     except Exception as e:
         logger.critical(f"Failed to initialize LLM Ranker: {e}")
         return
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    os.makedirs(os.path.dirname(args.old_format_output), exist_ok=True)
 
     stats = {
         "total_input": 0,
@@ -48,10 +52,9 @@ def main():
 
     try:
         with open(args.input, 'r', encoding='utf-8') as f_in, \
-                open(args.output, 'w', encoding='utf-8') as f_out, \
+                open(args.old_format_output, 'w', encoding='utf-8') as f_out, \
                 open(args.error_log, 'w', encoding='utf-8') as f_err:
 
-            # 使用 tqdm 显示进度
             for line in tqdm(f_in, desc="LLM Ranking"):
                 if not line.strip(): continue
                 stats["total_input"] += 1

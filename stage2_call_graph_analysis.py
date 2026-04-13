@@ -186,20 +186,17 @@ Avg Edges              : {avg_deps:.2f}
 # 主流程
 # ─────────────────────────────────────────────
 
+def parse_args():
+    p = argparse.ArgumentParser(description="NEP Pipeline — Phase 2: Static Analysis (Resumable)")
+    p.add_argument("--input",     required=True,  help="Phase 1 output (.jsonl or .jsonl.gz)")
+    p.add_argument("--output",    default="output/analyzed.jsonl", help="Output JSONL file path")
+    p.add_argument("--repo_path", required=True,  help="Local path to the git repository")
+    p.add_argument("--reset",     action="store_true", help="Ignore checkpoint and restart from scratch")
+    return p.parse_args()
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="NEP Dataset Builder - Phase 2: Analysis (Single Process, Resumable)"
-    )
-    parser.add_argument("--input",     type=str, required=True,
-                        help="Path to Phase 1 output (candidates.jsonl or .gz)")
-    parser.add_argument("--output",    type=str,
-                        default="output/pandas/analyzed_commits.jsonl",
-                        help="Output path")
-    parser.add_argument("--repo_path", type=str, required=True,
-                        help="Local path to git repository")
-    parser.add_argument("--reset",     action="store_true",
-                        help="Ignore existing checkpoint and start from scratch")
-    args = parser.parse_args()
+    args       = parse_args()
 
     output_dir = os.path.dirname(os.path.abspath(args.output))
     os.makedirs(output_dir, exist_ok=True)

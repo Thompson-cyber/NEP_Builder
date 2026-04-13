@@ -68,8 +68,7 @@ class RepoMiner:
                     if pattern in fname:
                         is_test = True
                         break
-                if commit.hash == '72d97bceec1af70d9b65bb49d12abdd5694e67f1':
-                    pass
+
                 # 如果是源代码文件，检查是否在忽略列表
                 if any(fname.endswith(ext) for ext in self.config.SOURCE_EXTENSIONS):
                     is_ignored = False

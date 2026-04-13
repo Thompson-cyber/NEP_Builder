@@ -1,267 +1,232 @@
-## 完整字段字典
+# NEP Benchmark Pipeline
 
-### 元信息字段
+> **N**ext-**E**dit **P**rediction — 从 Git 仓库自动构建代码变更因果排序数据集。
 
-| 字段名 | 类型 | 描述 |
-|---|---|---|
-| `sample_id` | str | MD5 唯一标识，由 repo+commit+anchor+target 生成 |
-| `repo` | str | 仓库全名，如 `apache/dubbo` |
-| `commit_sha` | str | commit hash 前8位 |
-| `commit_message` | str | 原始 commit message，截断至200字符 |
-| `commit_date` | str | 提交日期 `YYYY-MM-DD` |
-| `language` | str | 主语言 `Java / Python / TypeScript` |
-| `is_negative` | bool | 是否为困难负样本 |
-| `quality_score` | float | 综合质量分 0-100 |
-| `quality_tier` | str | 质量等级 `high / medium / low` |
-| `score_breakdown` | dict | 各维度得分明细 |
+给定一个 Git 仓库，流水线自动完成：
+1. **挖掘**同时包含源码修改与测试修改的高质量 Commit
+2. **分析**每个 Commit 的 Diff Hunk 及其静态依赖关系
+3. **排序**：调用 LLM 识别根因 Hunk，建模修改传播顺序
+
+最终输出可直接用于训练/评测的 `trigger_edit → ground_truth` 数据对。
 
 ---
 
-### 锚点字段
+## 目录结构
 
-> 锚点 = 已知发生变更的文件，是模型的**核心输入信号**
-
-| 字段名                        | 类型 | 描述                                             |
-|----------------------------|---|------------------------------------------------|
-| `anchor_file`              | str | 锚点文件相对路径，如 `src/main/service/UserService.java` |
-| `anchor_diff`              | str | 锚点文件的原始 git diff 字符串，包含 hunk header            |
-| `anchor_diff_size`         | int | 锚点 diff 中新增+删除的总行数                             |
-| `anchor_content_before`    | str | 锚点文件**修改前**完整内容，超过512行则截断至变更区域±100行            |
-| `anchor_context`           | str | 锚点文件依赖的上下文(有不是目标文件位置的)                         
-| `anchor_required_context`  | str | 锚点文件必须依赖依赖的上下文(准确的目标文件位置)                      |
-| `anchor_content_after(可选)` | str | 锚点文件**修改后**完整内容，同上截断策略                         |
-
----
-
-### 目标文件字段，这里应该是一个List，并且按照hunk分割
-
-> 目标 = 需要模型预测「是否需要改、改哪里、改成什么」的文件
-
-| 字段名                      | 类型 | 描述                                 |
-|--------------------------|---|------------------------------------|
-| `target_file`            | str | 目标文件相对路径                           |
-| `target_diff`            | str | 目标文件的原始 git diff 字符串，用于重建所有衍生字段    |
-| `target_diff_size`       | int | 目标 diff 中新增+删除的总行数                 |
-| `start_line`             | int | 目标hunk修改的起始行                       
-| `end_line`               | int | 目标hunk修改的终止行                       |
-| `target_content_before`  | str | 目标文件**修改前**完整内容，这是阶段2和阶段3的**直接输入** |
-| `target_content_after`   | str | 目标文件**修改后**完整内容，用于阶段3的结果验证和评估      |
-| `target_content_context` | str | 目标文件前的上下文                          |
-
----
-
-### 行级别定位字段
-
-> 阶段2的**输出标签**，同时作为阶段3的**输入**
-
-| 字段名 | 类型 | 描述 |
-|---|---|---|
-| `changed_lines` | list[list[int]] | 需要修改的行范围列表，格式 `[[start, end], ...]`，行号从1开始 |
-| `change_types` | list[str] | 与 `changed_lines` 一一对应的变更类型，取值 `MODIFY / ADD / DELETE` |
-
-**示例**：
-```python
-"changed_lines": [[43, 45], [78, 78]],
-"change_types":  ["MODIFY", "ADD"]
-# 含义：第43-45行需要修改，第78行需要新增内容
+```
+.
+├── stage1_collect_commits.py          # Phase 1 入口：Commit 挖掘
+├── stage2_call_graph_analysis.py          # Phase 2 入口：静态分析（支持断点续跑）
+├── stage3_llm_analysis.py         # Phase 2b 入口：LLM 因果排序
+│
+├── config/
+│   └── settings.py         # MiningConfig — 所有阈值与开关
+│
+├── filters/
+│   ├── base.py             # BaseFilter 抽象基类
+│   └── benchmark_filters.py# BenchmarkFilter — Phase 1 多维过滤
+│
+├── mining/
+│   └── miner.py            # RepoMiner — 遍历 & 提取 CommitCandidate
+│
+├── core/
+│   ├── types.py            # 全局数据模型（Pydantic）
+│   └── llm_ranker.py       # LLMCausalRanker + CausalDatasetExporter
+│
+└── analysis/
+    ├── processor.py        # CommitProcessor — Phase 2 主处理器
+    ├── slicer.py           # DiffSlicer — Hunk 切片
+    ├── graph.py            # DependencyGraph — 拓扑排序
+    └── graph_analyzer.py   # GraphDependencyAnalyzerWrapper — AST 依赖分析
 ```
 
 ---
 
-### 结构化编辑操作字段
+## 快速开始
 
-> 阶段3的**直接输出标签**，比 diff 字符串更易于模型学习
+### 1. 安装依赖
 
-| 字段名 | 类型 | 描述 |
-|---|---|---|
-| `code_edits` | list[dict] | 结构化编辑操作列表，每条对应一个 hunk |
-| `code_edits[].edit_type` | str | 操作类型：`REPLACE`（改）/ `INSERT`（增）/ `DELETE`（删） |
-| `code_edits[].start_line` | int | 操作起始行号（基于修改前文件） |
-| `code_edits[].end_line` | int | 操作结束行号（基于修改前文件） |
-| `code_edits[].old_code` | str | 修改前的代码片段，`INSERT` 时为空字符串 |
-| `code_edits[].new_code` | str | 修改后的代码片段，`DELETE` 时为空字符串 |
+```bash
+pip install pydriller loguru tqdm pydantic openai python-dotenv
+```
 
-**示例**：
-```python
-"code_edits": [
-    {
-        "edit_type":  "REPLACE",
-        "start_line": 43,
-        "end_line":   45,
-        "old_code":   "public User getUserById(int id) {\n    return repo.find(id);\n}",
-        "new_code":   "public User getUserById(String id) {\n    return repo.find(id);\n}"
-    },
-    {
-        "edit_type":  "INSERT",
-        "start_line": 78,
-        "end_line":   78,
-        "old_code":   "",
-        "new_code":   "if (id == null) throw new IllegalArgumentException(\"id cannot be null\");"
-    }
-]
+### 2. 配置环境变量
+
+在项目根目录创建 `.env`：
+
+```env
+LLM_API_KEY=your_api_key_here
+LLM_BASE_URL=https://api.deepseek.com   # 或其他兼容 OpenAI 接口的服务
+LLM_MODEL=deepseek-reasoner
+LLM_MAX_DIFF_LINES=5000
+```
+
+### 3. 运行流水线
+
+```bash
+# Phase 1 — 挖掘候选 Commit
+python stage1_collect_commits.py \
+    --repo      /path/to/your/repo \
+    --repo_name pandas \
+    --output    output/pandas/candidates.jsonl \
+    --limit     500
+
+# Phase 2 — 静态分析（支持 Ctrl+C 后断点续跑）
+python stage2_call_graph_analysis.py \
+    --input     output/pandas/candidates.jsonl \
+    --output    output/pandas/analyzed.jsonl \
+    --repo_path /path/to/your/repo
+
+# Phase 2b — LLM 因果排序
+python stage3_llm_analysis.py \
+    --input     output/pandas/analyzed.jsonl \
+    --old_format_output     output/pandas/old_analyzed.jsonl \
+    --output    output/pandas/final_dataset.jsonl \
+    --error_log output/pandas/llm_failures.jsonl
 ```
 
 ---
 
-### 局部上下文窗口字段
+## 流水线说明
 
-> 阶段3补全器的关键输入：让模型看到定位行的**局部代码环境**，而不是整个文件
+### Phase 1 — Commit 挖掘
 
-| 字段名 | 类型 | 描述 |
-|---|---|---|
-| `location_contexts` | list[dict] | 每个定位区域对应一个上下文窗口，与 `changed_lines` 一一对应 |
-| `location_contexts[].location_idx` | int | 对应 `changed_lines` 的下标 |
-| `location_contexts[].start` | int | 定位区域起始行 |
-| `location_contexts[].end` | int | 定位区域结束行 |
-| `location_contexts[].change_type` | str | 该区域的变更类型 |
-| `location_contexts[].context_before` | str | 定位行**之前** 30 行代码，带行号前缀，格式 `"L42: public class..."` |
-| `location_contexts[].context_after` | str | 定位行**之后** 30 行代码，带行号前缀 |
-| `location_contexts[].focal_lines_before` | str | 定位行区域**修改前**的代码，带行号，这是阶段3的**局部输入** |
-| `location_contexts[].focal_lines_after` | str | 定位行区域**修改后**的代码，带行号，这是阶段3的**局部标签** |
+使用 `pydriller` 遍历仓库历史，通过 `BenchmarkFilter` 过滤出满足以下**全部条件**的 Commit：
 
----
+| 条件 | 说明 |
+|------|------|
+| 无 ADD / DELETE 文件 | 只关注 MODIFY 类型变更 |
+| 必须有新增行 | 每个修改文件都有实际新增代码 |
+| 必须含测试文件 | 匹配 `TEST_FILE_PATTERNS` |
+| 必须含源码文件 | `.py/.java/.ts` 且不在忽略列表 |
+| 源文件数量 | `MIN_SOURCE_FILES` ≤ count ≤ `MAX_SOURCE_FILES` |
+| 源码行数变动 | `MIN_SOURCE_LOC` ≤ LOC ≤ `MAX_SOURCE_LOC` |
+| 源码 Hunk 数量 | `MIN_SOURCE_HUNKS` ≤ hunks ≤ `MAX_SOURCE_HUNKS` |
 
-### 跨文件依赖字段
-
-> 帮助模型理解「为什么这两个文件会共同变更」，两个阶段都使用
-
-| 字段名 | 类型 | 描述 |
-|---|---|---|
-| `repo_context` | dict | 仓库级别的跨文件语义关系 |
-| `repo_context.anchor_imports_target` | bool | anchor 文件是否静态 import 了 target 文件中的符号 |
-| `repo_context.target_imports_anchor` | bool | target 文件是否静态 import 了 anchor 文件中的符号 |
-| `repo_context.shared_package` | bool | 两个文件是否属于同一个包或模块（Java package / Python module） |
-| `repo_context.dependency_type` | str | 最强依赖关系类型：`CALLS`（调用）/ `INHERITS`（继承）/ `IMPLEMENTS`（实现接口）/ `USES_TYPE`（使用类型）/ `UNKNOWN` |
-| `repo_context.path_distance` | int | 两个文件在目录树中的距离，0 = 同目录，1 = 相差一级，以此类推 |
-| `repo_context.common_path_prefix` | str | 最长公共路径前缀，如 `src/main/service/` |
-| `repo_context.shared_identifiers` | list[str] | anchor diff 和 target diff 中共同出现的标识符列表，是语义相关性的直接证据 |
+**输出**：`CommitCandidate` JSONL，每行一个候选 Commit。
 
 ---
 
----
+### Phase 2 — 静态分析
 
-## 各阶段输入输出完整定义
-
----
-
-### 阶段 0 — 数据准备
+对每个 `CommitCandidate` 依次执行：
 
 ```
-输入
-└── 本地 Git 仓库（裸仓库或完整仓库）
-
-输出（每条样本包含的字段）
-├── 全部元信息字段
-├── 全部锚点字段
-├── 全部目标文件字段
-├── 全部行级别定位字段        ← 作为阶段2的训练标签
-├── 全部结构化编辑操作字段    ← 作为阶段3的训练标签
-├── 全部局部上下文窗口字段    ← 作为阶段3的输入特征
-└── 全部跨文件依赖字段        ← 两个阶段共用的辅助特征
+Diff 合并
+    └─► DiffSlicer.slice()         → List[Hunk]
+            └─► 分类 source / test hunks
+                    └─► AST 依赖图（新状态 commit）
+                    └─► AST 依赖图（旧状态 parent commit）
+                            └─► CoChangeValidator 验证
+                                    └─► DependencyGraph 拓扑排序
+                                            └─► AnalyzedCommit
 ```
 
----
+**过滤漏斗**（按顺序）：
 
-### 阶段 1 — 数据验证与划分
+1. Missing Source / Diff 为空
+2. DiffSlicer 解析异常
+3. 切片结果为空
+4. Source Hunk 数量不足（< `MIN_SOURCE_HUNKS`）
+5. AST 依赖图构建失败
+6. 新旧依赖图均无边（`REQUIRE_DEPENDENCY=True`）
+7. 存在孤立 Hunk（`NO_ISOLATED_HUNKS=True`）
+8. 拓扑排序异常
 
-```
-输入
-└── 阶段0输出的完整 JSONL 文件
+**断点续跑**：中断后直接重新运行相同命令即可从上次位置继续；`--reset` 参数可强制重头开始。
 
-输出
-├── train.jsonl   80%  high + medium 样本，按仓库维度划分防止泄露
-├── val.jsonl     10%  high + medium 样本
-└── test.jsonl    10%  仅 high 样本，用于最终评估
-```
+**输出**：`AnalyzedCommit` JSONL，含拓扑排序后的 `ordered_hunks` 及依赖图信息。
 
 ---
 
-### 阶段 2 — 行级别定位器（微调 Qwen3-7B）
+### Phase 3 — LLM 因果排序
 
-**训练时**：
-```
-输入 Prompt
-├── [INST] commit_message
-├── [ANCHOR_PATH] anchor_file
-├── [ANCHOR_DIFF] anchor_diff
-├── [ANCHOR_CODE] anchor_content_after     # 锚点改完后长什么样
-├── [TARGET_PATH] target_file
-├── [TARGET_CODE] target_content_before    # 目标文件现在长什么样（带行号）
-└── [RELATION] repo_context                # 两文件的关系描述
+调用 LLM（默认 `deepseek-reasoner`）完成四项任务：
 
-输出标签
-└── JSON 格式的 changed_lines + change_types
-    {"locations": [{"start": 43, "end": 45, "type": "MODIFY"}, ...]}
-```
+| 任务 | 说明 |
+|------|------|
+| 根因识别 | 找出触发本次变更的 Root Hunk |
+| 需求一致性 | 判断所有 Hunk 是否协同解决同一需求 |
+| 需求摘要 | 一句话描述本次变更的意图（≤ 20 词） |
+| 修改顺序 | 建模从 Root 出发的变更传播链路 |
 
-**推理时**：
-```
-输入  同上（target_content_before 是真实文件当前状态）
-输出  预测的需要修改的行范围，传递给阶段3
-```
+非单一需求或置信度 < 0.6 的 Commit 会被过滤丢弃。
 
-**评估指标**：
-```
-├── 行级别 Precision / Recall / F1
-├── 完全匹配率（预测行范围与真实行范围完全一致）
-└── 区间 IoU（预测区间与真实区间的交并比）
+**输出格式**（每行一条）：
+
+```jsonc
+{
+  "commit_hash": "abc1234...",
+  "commit_message": "Fix retry logic in HTTP client",
+  "requirement_summary": "Add retry mechanism to handle transient network failures.",
+  "trigger_edit": {          // Root Hunk（修改起点）
+    "file_path": "src/client.py",
+    "start_line": 42,
+    "before_code": "...",
+    "after_code": "..."
+  },
+  "ground_truth": [          // 后续 Hunk（有序，供评测）
+    { "file_path": "...", "before_code": "...", "after_code": "..." }
+  ],
+  "llm_analysis": {
+    "confidence": 0.92,
+    "change_pattern": "Bug Fix",
+    "hunk_order": [2, 0, 1]
+  }
+}
 ```
 
 ---
 
-### 阶段 3 — 代码补全器（微调 Qwen3-7B）
+## 配置参考
 
-**训练时**：
-```
-输入 Prompt
-├── [INST] commit_message
-├── [ANCHOR_PATH] anchor_file
-├── [ANCHOR_DIFF] anchor_diff
-├── [ANCHOR_CODE] anchor_content_after
-├── [TARGET_PATH] target_file
-├── [LOCATIONS] changed_lines + change_types    # 来自阶段2的真实标签（Teacher Forcing）
-├── [CONTEXT] location_contexts[]               # 每个定位区域的局部上下文窗口
-│   ├── context_before                          # 定位行前30行
-│   ├── focal_lines_before                      # 待修改行（修改前）
-│   └── context_after                           # 定位行后30行
-└── [RELATION] repo_context
+所有参数集中在 `config/settings.py` 的 `MiningConfig` 类中，可通过修改类变量或 `.env` 文件调整。
 
-输出标签
-└── code_edits（结构化编辑操作列表）
-    [{"edit_type": "REPLACE", "start_line": 43, "end_line": 45,
-      "old_code": "...", "new_code": "..."}, ...]
-```
+### 规模阈值（`FLAG='Multi'` 模式）
 
-**推理时**：
-```
-输入  同上，但 [LOCATIONS] 来自阶段2的预测结果（非真实标签）
-输出  code_edits，将其 apply 到 target_content_before 上得到最终修改后文件
-验证  apply 后的文件内容与 target_content_after 做 exact match / edit distance 对比
-```
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `MIN/MAX_SOURCE_LOC` | 3 / 20 | 源码行数变动范围 |
+| `MIN/MAX_SOURCE_FILES` | 1 / 5 | 源码文件数量范围 |
+| `MIN/MAX_SOURCE_HUNKS` | 2 / 5 | 源码 Hunk 数量范围 |
 
-**评估指标**：
-```
-├── CodeBLEU                      # 代码语义相似度
-├── Exact Match Rate              # 与 target_content_after 完全一致的比例
-├── Edit Distance                 # 字符级别编辑距离
-└── Compilable Rate               # 修改后代码是否能通过语法检查（AST valid）
-```
+> 将 `FLAG` 改为 `'Single'` 可切换为单文件单 Hunk 模式（适合更简单的任务）。
+
+### 行为开关
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `REQUIRE_DEPENDENCY` | `True` | 必须存在显式依赖边 |
+| `NO_ISOLATED_HUNKS` | `True` | 不允许孤立 Hunk |
+| `ALLOW_CYCLES` | `True` | 允许依赖环路 |
+| `REQUIRE_TEST_CHANGE` | `True` | 必须包含测试文件修改 |
+
+### 支持的文件类型
+
+| 类型 | 扩展名 / 模式 |
+|------|--------------|
+| 源码 | `.py` `.java` `.ts` |
+| 测试 | `test_*` `*_test.py` `tests/` `.spec.ts` `.test.ts` |
+| 忽略 | `setup.py` `__init__.py` `conftest.py` `docs/conf.py` |
 
 ---
 
-## 字段使用矩阵
+## 输出文件说明
 
-| 字段 | 阶段2输入 | 阶段2标签 | 阶段3输入 | 阶段3标签 | 阶段3验证 |
-|---|:---:|:---:|:---:|:---:|:---:|
-| `commit_message` | ✅ | | ✅ | | |
-| `anchor_file` | ✅ | | ✅ | | |
-| `anchor_diff` | ✅ | | ✅ | | |
-| `anchor_content_after` | ✅ | | ✅ | | |
-| `target_file` | ✅ | | ✅ | | |
-| `target_content_before` | ✅ | | ✅ | | |
-| `target_content_after` | | | | | ✅ |
-| `repo_context` | ✅ | | ✅ | | |
-| `changed_lines` | | ✅ | ✅ | | |
-| `change_types` | | ✅ | ✅ | | |
-| `location_contexts` | | | ✅ | | |
-| `code_edits` | | | | ✅ | |
+| 文件 | 来源 | 说明 |
+|------|------|------|
+| `candidates.jsonl` | Phase 1 | 原始候选 Commit |
+| `analyzed.jsonl` | Phase 2 | 含依赖图的分析结果 |
+| `phase2_stats.json` | Phase 2 | 过滤漏斗统计数据 |
+| `phase2_checkpoint.json` | Phase 2 | 断点续跑进度文件（完成后自动删除）|
+| `final_dataset.jsonl` | Phase 2b | 最终训练/评测数据集 |
+| `llm_failures.jsonl` | Phase 2b | LLM 处理失败的条目（供重试）|
+
+---
+
+## 注意事项
+
+- **Phase 2 断点续跑**：中断后重新运行相同命令即可；若需重头开始请加 `--reset`。
+- **LLM 费用**：Phase 2b 每个 Commit 调用一次 LLM，建议先在小数据集上测试。
+- **仓库路径**：Phase 1 与 Phase 2 需传入**同一个**本地仓库路径，且该仓库需有完整 Git 历史。
+- **Java / TypeScript 支持**：`SOURCE_EXTENSIONS` 已包含 `.java` 和 `.ts`，但 AST 分析器（`graph_analyzer.py`）需确认支持对应语言。
