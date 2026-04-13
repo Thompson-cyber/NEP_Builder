@@ -16,35 +16,49 @@ class RepoMiner:
         self.filters = filters
         self.config = MiningConfig()
 
-    def mine(self ) -> Iterator[CommitCandidate]:
-        # repo = Repository(self.repo_path, order='reverse',only_no_merge=False)
-        repo = Repository(self.repo_path,only_no_merge=False)
+    def mine(self) -> Iterator[CommitCandidate]:
+        repo = Repository(self.repo_path, only_no_merge=False)
 
-        count = 0
+        stats = {"total": 0, "error": 0, "filter_rejected": 0, "extract_none": 0, "yielded": 0}
+
         for commit in repo.traverse_commits():
+            stats["total"] += 1
+            try:
+                passed = True
+                for f in self.filters:
+                    if not f.check(commit, self.config):
+                        passed = False
+                        break
 
-            logger.info(f"[miner]:{commit.hash}")
-            if commit.merge:
-                # print(f"Commit {commit.hash} 是合并提交，通常没有 modified_files {len(commit.modified_files)}")
-                pass
-            else:
-                # print(f"Commit {commit.hash} 文件数: {len(commit.modified_files)}")
-                pass
-            # 运行过滤器
-            passed = True
-            for f in self.filters:
-                if not f.check(commit, self.config):
-                    passed = False
-                    break
+                if not passed:
+                    stats["filter_rejected"] += 1
+                    continue
 
-            if not passed:
-                continue
+                candidate = self._extract(commit)
+                if candidate is None:
+                    stats["extract_none"] += 1
+                    continue
 
-            # 提取数据
-            candidate = self._extract(commit)
-            if candidate:
+                stats["yielded"] += 1
                 yield candidate
-                count += 1
+
+            except Exception as e:
+                stats["error"] += 1
+                logger.warning(
+                    f"[{self.repo_name}] 未捕获异常: {e} "
+                    f"| commit={commit.hash[:7]} "
+                    f"| 已跳过，继续下一个"
+                )
+                continue  # ← 核心：跳过这个 commit，不终止整个迭代
+
+        logger.info(
+            f"[{self.repo_name}] Mining 完成 | "
+            f"total={stats['total']} "
+            f"rejected={stats['filter_rejected']} "
+            f"error={stats['error']} "
+            f"extract_none={stats['extract_none']} "
+            f"yielded={stats['yielded']}"
+        )
 
     def _extract(self, commit) -> Optional[CommitCandidate]:
         try:

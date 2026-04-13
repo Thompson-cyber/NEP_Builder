@@ -87,8 +87,8 @@ class BenchmarkFilter(BaseFilter):
         # 2. 核心检查逻辑
         # print(f"测试文件数量：{test_files_count};源码文件数量:{source_files_count}")
         # A. 必须有测试
-        if not has_test:
-            return False
+        # if not has_test:
+        #     return False
         # B. 必须有源码，且数量符合要求
         if not (config.MIN_SOURCE_FILES <= source_files_count <= config.MAX_SOURCE_FILES):
             return False
