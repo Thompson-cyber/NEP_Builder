@@ -1,0 +1,59 @@
+# ========================
+# 🔐 敏感信息 / 密钥文件
+# ========================
+.env
+.env.local
+.env.*.local
+secrets.py
+*.key
+*.pem
+
+# ========================
+# 📁 项目输出 / 缓存目录
+# ========================
+visualize/
+sandboxes/
+output/
+graph_cache/
+
+# ========================
+# 🐍 Python 相关
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# ========================
+# 🧪 测试 / 覆盖率
+# ========================
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# ========================
+# 💻 IDE / 编辑器
+# ========================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ========================
+# 📁 日志
+# ========================
+logs/
+*.log
+.cache/
