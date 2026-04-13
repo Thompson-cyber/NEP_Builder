@@ -211,94 +211,114 @@ Code Diff:
 {content_snippet}
 ```
 """
-
         prompt = f"""
-## Goal
-Analyze the following commit and complete FOUR tasks:
-1. Identify the single "Root Cause" Hunk — the starting point of the change propagation.
-2. Determine whether ALL hunks collaboratively solve ONE single requirement.
-3. If they do, generate a concise requirement summary based on the commit message.
-4. Model the modification order of ALL hunks (starting from the Root), reflecting the
-   logical propagation sequence of the change (i.e., which hunk must be changed first
-   to necessitate the next).
+        Goal
+        Analyze the following commit and complete FOUR tasks:
 
----
+        Identify the single "Root Cause Hunk" — the logical origin of this change propagation.
+        Determine whether ALL hunks collaboratively solve ONE single requirement.
+        If they do, generate a concise requirement summary in English.
+        Model the modification order of ALL hunks (starting from the Root), reflecting the logical propagation sequence of the change.
+        Note: All test files and comment-only changes have already been excluded from the input.
+        You do not need to consider them.
 
-## Context
+        Context
+        Commit Message
+        {commit.msg}
 
-### Issue Description
-{issue_text}
+        Candidate Hunks ({total_hunks} total, all production code)
+        {hunks_display}
+        
+        Original Diff
+        {commit.source_diff}
+        
+        Reasoning Guidelines
+        Task 1 — Root Cause Identification
+        Positive signals — the following features point to the Root:
 
-### Commit Message
-{commit.msg}
+        New symbol definition: A hunk introduces a new function, class, constant, or type definition, while another hunk calls or references it → The definition side is the Root; the call site is a responder.
+        Pure new file/block: A hunk tagged "PURE NEW FILE/BLOCK" introduces an entirely new logical unit → If its content directly corresponds to the core intent in the Commit Message, treat it as the Root.
+        Abstraction-layer change: A hunk modifies an interface, base class, or core configuration entry → The hunk modifying the abstraction layer is the Root; implementation/adapter hunks are responders.
+        Inline logic removal + new encapsulation: One hunk removes hardcoded/inline logic, another introduces an encapsulating function → The encapsulation hunk is the Root (it embodies the core intent); the removal hunk is a responder.
+        Semantic density asymmetry: A hunk with fewer changed lines but higher semantic density (introduces a new concept or branch) is likely the Root; a hunk with many mechanical changes (bulk replacement/adaptation) is likely a responder.
+        Commit Message alignment: The hunk whose changes most directly correspond to the core intent described in the Commit Message is the Root.
+        Elimination method — the following features rule out the Root:
 
-### Static Dependency Graph (Extracted by AST)
-The following call/import dependencies were detected between hunks.
-"Hunk A depends on Hunk B" means A calls or imports B — B is more likely the Root.
+        If a hunk's changes can be fully explained by another hunk's changes (i.e., "this had to change because that changed"), it is a responder, not the Root.
+        If removing this hunk leaves the remaining hunks' intent still complete and understandable, it is not the Root.
+        A pure call-site adaptation (e.g., replacing an old function call with a new one) is never the Root.
+        A pure parameter pass-through (e.g., forwarding a new parameter from an upper layer to a lower layer) is never the Root.
+        Root identification rules by change type:
 
-{dependency_text}
+        Refactoring : The hunk modifying the function/class definition is the Root; the hunk modifying call sites is a responder.
+        Bug Fix : The hunk correcting the core logic error is the Root; adaptation changes are responders.
+        Enhancement : The hunk extending the primary abstraction or core logic is the Root; interface updates are responders.
+        New Feature : The hunk introducing the core new logic is the Root; registration/wiring/routing hunks are responders.
+        Config Change : The hunk modifying the core configuration entry is the Root; reader-side adaptations are responders.
+        Composite type : When a hunk simultaneously embodies a refactoring technique and a fix/enhancement purpose (e.g., extracting a function while introducing new branch logic), prioritize the fix/enhancement intent to locate the Root — the hunk that introduces new behavior is the Root, not the one performing only structural reorganization.
+        Task 2 — Single-Requirement Coherence Check
+        Mark is_single_requirement: true ONLY when ALL of the following hold:
 
-### Candidate Hunks
-{hunks_display}
+        Every hunk serves one unified intent (same bug, same feature, same refactoring goal).
+        All hunks are semantically connected through causal or adaptation relationships (no isolated nodes).
+        The Commit Message describes a single, coherent change objective.
+        Mark is_single_requirement: false when ANY of the following is observed:
 
----
+        Hunks touch completely unrelated modules with no semantic causal connection between them.
+        The Commit Message lists multiple unrelated items (e.g., "fix X; also refactor Y").
+        An incidental, unrelated change is mixed in (e.g., fixing an unrelated typo or formatting while implementing a feature).
+        Multiple hunks each fix a different bug, even if all are of "Bug Fix" type.
+        A hunk only updates a version number, changelog, or metadata unrelated to the core logic.
+        Some hunks are pure whitespace or formatting changes unrelated to the core requirement.
+        Task 3 — Requirement Summary
+        Generate ONLY when is_single_requirement is true; otherwise output null.
+        Language: Always write in English, regardless of the language of the Commit Message.
+        Exactly ONE sentence, no more than 20 words.
+        Focus on WHAT was changed and WHY — not HOW.
+        Avoid code symbols, file names, or variable names.
+        Good example : "Suppress redundant manual approval instructions on platforms with native approval UI."
+        Bad example : "Modified buildExecApprovalPromptGuidance in system-prompt.ts to add a channel check."
+        Task 4 — Hunk Modification Order
+        Output an ordered list of ALL hunk indices (0 to {total_hunks - 1}), including the Root.
+        The Root hunk MUST appear FIRST (position 0 of the order list).
+        Order the remaining hunks by their logical dependency on prior hunks:
+        Hunks that directly depend on the Root (call a newly defined symbol, or adapt to the Root's change) come immediately after the Root.
+        Hunks that depend on the second hunk come after the second hunk, and so on (chain propagation takes priority).
+        Tie-breaking rules for parallel dependencies (when multiple hunks depend equally on the same prior hunk):
+        Prefer hunks in the same file as the prior hunk (file locality first).
+        Within the same file, order by ascending line number.
+        Across files, prefer core-module hunks (business logic) before peripheral-module hunks (CLI / routing / adapter layer).
+        Every hunk index must appear exactly once — no omissions, no duplicates.
+        Confidence Score Anchors
+        Score strictly according to the anchors below. Do not inflate scores:
 
-## Reasoning Guidelines
+        Score Range	Meaning
+        0.9 – 1.0	Root is unique and unambiguous; causal chain across all hunks is clear; no isolated nodes
+        0.7 – 0.9	Root is largely certain; one parallel dependency or ordering uncertainty exists, but overall logic is coherent
+        0.5 – 0.7	Two root candidates exist, or one hunk has a weak semantic connection; inference is required
+        0.3 – 0.5	Root is uncertain; multiple hunks have ambiguous semantic relationships; ordering is difficult to determine
+        0.0 – 0.3	Hunks have almost no semantic connection; causal chain cannot be reliably modeled
+        Output Format
+        Respond with a single JSON object — no Markdown fences, no extra text.
+        The reasoning field must be an object with exactly four keys,
+        each covering the reasoning process for one task:
 
-### Task 1 — Root Cause Identification
-Ask: which hunk introduces the *core intent* described in the Issue / Commit Message?
-- **Refactoring**   : The hunk that changes the function/class *definition* is the Root.
-- **New Feature**   : The hunk introducing the core logic is the Root; UI/CLI wiring is secondary.
-- **Bug Fix**       : The hunk that corrects the logic error is the Root. Test hunks are NEVER the Root.
-- **Config Change** : The hunk modifying the core config entry is the Root.
-- **Enhancement**   : The hunk that extends the primary abstraction is the Root.
-
-### Task 2 — Single-Requirement Coherence Check
-Mark `is_single_requirement: true` only when ALL of the following hold:
-- Every hunk serves one unified intent (same bug, same feature, same refactoring goal).
-- No unrelated cleanup, hotfix, or refactoring hunks are mixed in.
-- The dependency graph is connected or star-shaped (no isolated islands).
-Mark `is_single_requirement: false` when ANY of the following is observed:
-- Hunks touch completely unrelated modules with no dependency path between them.
-- The commit message lists multiple unrelated items (e.g., "fix X; also refactor Y").
-- Some hunks are pure whitespace / formatting changes unrelated to the feature.
-
-### Task 3 — Requirement Summary
-- Generate ONLY when `is_single_requirement` is true; otherwise output `null`.
-- Write exactly ONE sentence, no more than 20 words.
-- Focus on WHAT was changed and WHY — not HOW.
-- Use plain English; avoid code symbols, file names, or variable names.
-- Good example : "Add retry mechanism to HTTP client to handle transient network failures."
-- Bad example  : "Modified `_retry_count` in `http_client.py` and updated `send()` method."
-
-### Task 4 — Hunk Modification Order
-- Output an ordered list of ALL hunk indices (0 to {total_hunks - 1}), including the Root.
-- The Root hunk must appear FIRST (index 0 of the order list).
-- Order the remaining hunks by their logical dependency on prior hunks:
-    * A hunk that is directly called by / depends on the Root comes next.
-    * A hunk that adapts to a change in a prior hunk comes after that prior hunk.
-    * Test hunks and documentation hunks always come LAST.
-- If two hunks have no dependency between them, order by file-level locality
-  (hunks in the same file as an earlier hunk come before unrelated files).
-- Every hunk index must appear exactly once.
-
----
-
-## Output Format
-Respond with a single JSON object — no markdown fences, no extra text.
-
-{{
-  "root_hunk_index"      : <int, 0 to {total_hunks - 1}>,
-  "confidence_score"     : <float, 0.0 to 1.0>,
-  "change_pattern"       : "Refactoring" | "New Feature" | "Bug Fix" | "Config Change" | "Enhancement",
-  "is_single_requirement": <bool>,
-  "requirement_summary"  : "<one-sentence summary>" | null,
-  "hunk_order"           : [<int>, <int>, ...],
-  "reasoning"            : "<concise explanation covering all four tasks, referencing dependency edges where relevant>"
-}}
-"""
+        {{
+        "root_hunk_index"      : <int, 0 to {total_hunks - 1}>,
+        "confidence_score"     : <float, 0.0 to 1.0, strictly following the anchors above>,
+        "change_pattern"       : "Refactoring" | "Bug Fix" | "Enhancement" | "New Feature" | "Config Change" | "Refactoring+Bug Fix" | "Refactoring+Enhancement" | "Enhancement+Bug Fix" | "New Feature+Refactoring",
+        "is_single_requirement": <bool>,
+        "requirement_summary"  : "<one-sentence English summary, ≤ 20 words>" | null,
+        "hunk_order"           : [<int>, <int>, ...],
+        "reasoning": {{
+        "root_cause"      : "<positive evidence + elimination reasoning: why this hunk is the Root, and why others are ruled out>",
+        "coherence_check" : "<evaluate each condition for single-requirement judgment; explicitly state which conditions pass or fail and why>",
+        "summary_basis"   : "<explain which information the summary is derived from: Commit Message and/or which hunk's core change>",
+        "order_rationale" : "<for each non-root hunk, explain why it is placed at its current position; for parallel dependencies, state the tie-breaking rationale>"
+        }}
+        }}
+        """
         return prompt
-
 
 # ══════════════════════════════════════════════════════════════════════════
 # Exporter
