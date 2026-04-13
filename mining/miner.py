@@ -16,7 +16,7 @@ class RepoMiner:
         self.filters = filters
         self.config = MiningConfig()
 
-    def mine(self, limit: int ) -> Iterator[CommitCandidate]:
+    def mine(self ) -> Iterator[CommitCandidate]:
         repo = Repository(self.repo_path, order='reverse',only_no_merge=False)
 
         count = 0
@@ -42,8 +42,6 @@ class RepoMiner:
             if candidate:
                 yield candidate
                 count += 1
-                if count >= limit:
-                    break
 
     def _extract(self, commit) -> Optional[CommitCandidate]:
         try:

@@ -23,6 +23,8 @@ VALID_NODE_TYPES = [NODE_TYPE_DIRECTORY, NODE_TYPE_FILE, NODE_TYPE_CLASS, NODE_T
 VALID_EDGE_TYPES = [EDGE_TYPE_CONTAINS, EDGE_TYPE_INHERITS, EDGE_TYPE_INVOKES, EDGE_TYPE_IMPORTS]
 
 SKIP_DIRS = ['.github', '.git']
+
+
 def is_skip_dir(dirname):
     for skip_dir in SKIP_DIRS:
         if skip_dir in dirname:
@@ -51,7 +53,7 @@ def handle_edge_cases(code):
 def find_imports(filepath, repo_path, tree=None):
     if tree is None:
         try:
-            with open(filepath, 'r') as file:
+            with open(filepath, 'r', newline=None) as file:
                 tree = ast.parse(file.read(), filename=filepath)
         except:
             raise SyntaxError
@@ -168,14 +170,14 @@ class CodeAnalyzer(ast.NodeVisitor):
         self.node_type_stack.pop()
 
     def _get_source_segment(self, node):
-        with open(self.filename, 'r') as file:
+        with open(self.filename, 'r', newline=None) as file:
             source_code = file.read()
         return ast.get_source_segment(source_code, node)
 
 
 # Parese the given file, use CodeAnalyzer to extract classes and helper functions from the file
 def analyze_file(filepath):
-    with open(filepath, 'r') as file:
+    with open(filepath, 'r', newline=None) as file:
         code = file.read()
         # code = handle_edge_cases(code)
         try:
@@ -256,10 +258,10 @@ def add_imports(root_node, imports, graph, repo_path):
 def resolve_symlink(file_path):
     """
     Resolve the absolute path of a symbolic link.
-    
+
     Args:
         file_path (str): The symbolic link file path.
-    
+
     Returns:
         str: The absolute path of the target file if the file is a symbolic link.
         None: If the file is not a symbolic link.
@@ -280,7 +282,7 @@ def resolve_symlink(file_path):
         return None
 
 
-# Traverse all the Python files under repo_path, construct dependency graphs 
+# Traverse all the Python files under repo_path, construct dependency graphs
 # with node types: directory, file, class, function
 def build_graph(repo_path, fuzzy_search=True, global_import=False):
     graph = nx.MultiDiGraph()
@@ -300,7 +302,7 @@ def build_graph(repo_path, fuzzy_search=True, global_import=False):
             continue
         else:
             graph.add_node(dirname, type=NODE_TYPE_DIRECTORY)
-            parent_dirname  = os.path.dirname(dirname)
+            parent_dirname = os.path.dirname(dirname)
             if parent_dirname == '':
                 parent_dirname = '/'
             graph.add_edge(parent_dirname, dirname, type=EDGE_TYPE_CONTAINS)
@@ -328,7 +330,7 @@ def build_graph(repo_path, fuzzy_search=True, global_import=False):
                     if os.path.islink(file_path):
                         continue
                     else:
-                        with open(file_path, 'r') as f:
+                        with open(file_path, 'r', newline=None) as f:
                             file_content = f.read()
 
                     graph.add_node(filename, type=NODE_TYPE_FILE, code=file_content)
@@ -362,6 +364,11 @@ def build_graph(repo_path, fuzzy_search=True, global_import=False):
             for i in range(len(dir_include_stack)):
                 dir_include_stack[i] = True
 
+    bad_nodes = [n for n, d in graph.nodes(data=True) if 'type' not in d]
+    if bad_nodes:
+        print(f"⚠️  发现 {len(bad_nodes)} 个无 type 属性的节点（Linux 路径顺序 BUG）:")
+        for n in bad_nodes[:10]:
+            print(f"   {n}")
     # check last traversed directory
     while len(dir_stack) > 0:
         if not dir_include_stack[-1]:
@@ -384,10 +391,18 @@ def build_graph(repo_path, fuzzy_search=True, global_import=False):
             global_name_dict[node_name].append(node)
 
     ## add edges start from class/function
-    for node, attributes in graph.nodes(data=True):
+    print("开始分析边")
+    for node, attributes in list(graph.nodes(data=True)):
         if attributes.get('type') not in [NODE_TYPE_CLASS, NODE_TYPE_FUNCTION]:
             continue
+        node_code = graph.nodes[node].get('code')
+        if not node_code:
+            continue
 
+        try:
+            caller_code_tree = ast.parse(node_code)
+        except (TypeError, SyntaxError):
+            continue
         caller_code_tree = ast.parse(graph.nodes[node]['code'])
 
         # construct possible callee dict (name -> node) based on graph connectivity
@@ -511,7 +526,8 @@ def find_all_possible_callee(node, graph):
 
         pre_node = cur_node
         cur_node = find_parent(cur_node)
-
+        if cur_node is None:
+            break
     return callee_nodes, callee_alias
 
 

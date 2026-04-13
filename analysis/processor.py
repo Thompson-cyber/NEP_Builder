@@ -32,14 +32,16 @@ class CoChangeValidator:
 
 
 class CommitProcessor:
-    def __init__(self, repo_path: str):
+    def __init__(self, repo_path: str, use_graph: bool = True):
         self.slicer = DiffSlicer()
         self.graph_sorter = DependencyGraph()
         self.validator = CoChangeValidator()
         self.config = MiningConfig()
         self.llm_ranker = LLMCausalRanker(self.config)
         self.repo_path = repo_path
-
+        self.use_graph = use_graph
+        if not use_graph:
+            logger.info("[Config] Graph analysis DISABLED.")
     def _get_parent_hash(self, commit_hash: str) -> Optional[str]:
         """辅助函数：获取父提交 Hash"""
         try:
@@ -69,6 +71,7 @@ class CommitProcessor:
 
         # === 1. 数据提取 ===
         combined_diff_lines = []
+        source_diff_lines = []
         for fc in candidate.source_changes + candidate.test_changes:
             if not fc.diff: continue
             diff_text = fc.diff.strip()
@@ -77,7 +80,16 @@ class CommitProcessor:
                 diff_text = f"diff --git a/{path} b/{path}\n" + diff_text
             combined_diff_lines.append(diff_text)
 
+        for fc in candidate.source_changes:
+            if not fc.diff: continue
+            diff_text = fc.diff.strip()
+            path = fc.new_path or fc.old_path or "unknown"
+            if not diff_text.startswith("diff --git"):
+                diff_text = f"diff --git a/{path} b/{path}\n" + diff_text
+            source_diff_lines.append(diff_text)
+
         raw_diff = "\n".join(combined_diff_lines)
+        raw_source_diff = "\n".join(source_diff_lines)
         if not raw_diff:
             stats["stage"] = "missing_diff"
             return None, stats
@@ -107,6 +119,9 @@ class CommitProcessor:
         if len(source_hunks) < self.config.MIN_SOURCE_HUNKS:
             stats["stage"] = "too_few_source_hunks"
             return None, stats
+
+        if not self.use_graph:
+            return self._process_no_graph(candidate, source_hunks, test_hunks, stats,source_diff=raw_source_diff)
 
         # === 4.1 New State Analysis ===
         new_edges, new_metrics, new_chains, valid_hunks_new = [], {}, [], []
@@ -152,11 +167,12 @@ class CommitProcessor:
 
         # === 7. Construct Result ===
         analyzed_commit = AnalyzedCommit(
-            hash=candidate.hash, repo=candidate.repo_url, msg=candidate.msg,
+            hash=candidate.hash, repo=candidate.repo_name, msg=candidate.msg,
             ordered_hunks=sorted_hunks, test_hunks=test_hunks,
             dependencies=edges_debug, dependency_chains=new_chains,
             old_dependencies=old_edges, old_dependency_chains=old_chains,
-            old_metrics=old_metrics, new_metrics=new_metrics, dependency_label=dep_label
+            old_metrics=old_metrics, new_metrics=new_metrics, dependency_label=dep_label,
+            source_diff=raw_source_diff,
         )
 
         stats["stage"] = "success"
@@ -166,4 +182,51 @@ class CommitProcessor:
             "label": dep_label
         }
 
+        return analyzed_commit, stats
+
+    def _process_no_graph(
+            self,
+            candidate: CommitCandidate,
+            source_hunks: List[Hunk],
+            test_hunks: List[Hunk],
+            stats: Dict,
+            source_diff: str = "",
+    ) -> Tuple[Optional[AnalyzedCommit], Dict]:
+
+        if len(source_hunks) < self.config.MIN_SOURCE_HUNKS:
+            stats["stage"] = "too_few_source_hunks"
+            return None, stats
+
+        unique_files = set(h.file_path for h in source_hunks)
+        is_cross_file = len(unique_files) > 1
+
+        analyzed_commit = AnalyzedCommit(
+            hash=candidate.hash,
+            repo=candidate.repo_name,
+            msg=candidate.msg,
+            ordered_hunks=source_hunks,
+            test_hunks=test_hunks,
+            dependencies=[],
+            dependency_chains=[],
+            old_dependencies=[],
+            old_dependency_chains=[],
+            old_metrics={},
+            new_metrics={},
+            dependency_label="NO_GRAPH",
+            source_diff=source_diff,
+        )
+
+        stats["stage"] = "success"
+        stats["insights"] = {
+            "cross_file_ratio": (len([
+                h for h in source_hunks
+                if h.file_path != list(unique_files)[0]  # 非主文件的 hunk 占比
+            ]) / len(source_hunks)) if is_cross_file else 0,
+            "has_cycle": False,  # 无图，无法判断，保守置 False
+            "label": "NO_GRAPH",
+            "has_tests": len(test_hunks) > 0,
+            "n_files": len(unique_files),
+            "total_hunks": len(source_hunks),
+            "total_test_hunks": len(test_hunks),
+        }
         return analyzed_commit, stats

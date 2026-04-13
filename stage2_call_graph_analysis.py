@@ -10,18 +10,16 @@ from tqdm import tqdm
 from core.types import CommitCandidate
 from analysis.processor import CommitProcessor
 
+def _checkpoint_filename(repo_name: str, use_graph: bool) -> str:
+    mode = "graph" if use_graph else "no_graph"
+    return f"{repo_name}_phase2_{mode}_checkpoint.json"
 
+def _checkpoint_path(output_dir: str, repo_name: str, use_graph: bool) -> str:
+    return os.path.join(output_dir, _checkpoint_filename(repo_name, use_graph))
 
-CHECKPOINT_FILENAME = "phase2_checkpoint.json"
-
-
-def _checkpoint_path(output_dir: str) -> str:
-    return os.path.join(output_dir, CHECKPOINT_FILENAME)
-
-
-def load_checkpoint(output_dir: str) -> Dict[str, Any]:
+def load_checkpoint(output_dir: str, repo_name: str, use_graph: bool) -> Dict[str, Any]:
     """加载断点文件，返回上次的进度信息。"""
-    path = _checkpoint_path(output_dir)
+    path = _checkpoint_path(output_dir, repo_name, use_graph)
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             ckpt = json.load(f)
@@ -34,9 +32,9 @@ def load_checkpoint(output_dir: str) -> Dict[str, Any]:
     return {"processed_lines": 0, "stats": None}
 
 
-def save_checkpoint(output_dir: str, processed_lines: int, stats: Dict[str, Any]) -> None:
+def save_checkpoint(output_dir: str, processed_lines: int, stats: Dict[str, Any], repo_name: str, use_graph: bool) -> None:
     """将当前进度原子写入断点文件（先写临时文件再 rename，防止写坏）。"""
-    path = _checkpoint_path(output_dir)
+    path = _checkpoint_path(output_dir, repo_name, use_graph)
     tmp_path = path + ".tmp"
     payload = {"processed_lines": processed_lines, "stats": stats}
     with open(tmp_path, "w", encoding="utf-8") as f:
@@ -44,9 +42,9 @@ def save_checkpoint(output_dir: str, processed_lines: int, stats: Dict[str, Any]
     os.replace(tmp_path, path)  # 原子替换
 
 
-def clear_checkpoint(output_dir: str) -> None:
+def clear_checkpoint(output_dir: str, repo_name: str, use_graph: bool) -> None:
     """处理完成后删除断点文件。"""
-    path = _checkpoint_path(output_dir)
+    path = _checkpoint_path(output_dir, repo_name, use_graph)
     if os.path.exists(path):
         os.remove(path)
         logger.info("[Resume] Checkpoint cleared after successful completion.")
@@ -80,12 +78,15 @@ def process_single_line(
         if result:
             local_stats["is_success"] = True
             insights = proc_stats.get("insights", {})
-            local_stats["insights"]["cross_file"] = 1 if insights.get("cross_file_ratio", 0) > 0 else 0
-            local_stats["insights"]["single_file"] = 0 if insights.get("cross_file_ratio", 0) > 0 else 1
-            local_stats["insights"]["cycles_detected"] = 1 if insights.get("has_cycle", False) else 0
-            local_stats["insights"]["has_tests"] = 1 if insights.get("has_tests", False) else 0
-            local_stats["insights"]["total_hunks"] = len(result.ordered_hunks)
-            local_stats["insights"]["total_dependencies"] = len(result.dependencies)
+
+            cross_file_ratio = insights.get("cross_file_ratio", 0)
+            local_stats["insights"]["cross_file"]          = 1 if cross_file_ratio > 0 else 0
+            local_stats["insights"]["single_file"]         = 0 if cross_file_ratio > 0 else 1
+            local_stats["insights"]["cycles_detected"]     = 1 if insights.get("has_cycle", False) else 0
+            local_stats["insights"]["has_tests"]           = 1 if insights.get("has_tests", False) else 0
+            local_stats["insights"]["total_hunks"]         = len(result.ordered_hunks)
+            local_stats["insights"]["total_dependencies"]  = len(result.dependencies)  # no-graph 时为 0
+
             return result.model_dump_json(), local_stats, None
         else:
             local_stats["error_msg"] = proc_stats.get("error")
@@ -96,7 +97,7 @@ def process_single_line(
 
 
 # ─────────────────────────────────────────────
-# 初始化全量 stats 结构（供首次运行 & 类型提示）
+# 初始化全量 stats 结构
 # ─────────────────────────────────────────────
 
 def _empty_stats() -> Dict[str, Any]:
@@ -104,10 +105,12 @@ def _empty_stats() -> Dict[str, Any]:
         "total_input": 0,
         "total_output": 0,
         "errors": 0,
+        "no_graph_mode": False,
         "filters": {
             "missing_source": 0, "slicing_error": 0, "slicing_empty": 0,
-            "too_few_hunks": 0, "no_dependency": 0, "validation_fail": 0,
-            "analysis_error": 0, "sorting_error": 0, "unknown": 0,
+            "too_few_hunks": 0, "too_many_hunks": 0, "no_dependency": 0,
+            "validation_fail": 0, "analysis_error": 0, "sorting_error": 0,
+            "unknown": 0,
         },
         "insights": {
             "single_file": 0, "cross_file": 0, "cycles_detected": 0,
@@ -125,13 +128,14 @@ def _update_stats(stats: Dict[str, Any], local_stats: Dict[str, Any]) -> None:
     else:
         stage = local_stats["stage"]
         stage_map = {
-            "missing_source":           "missing_source",
-            "slicing_error":            "slicing_error",
-            "empty_hunks":              "slicing_empty",
-            "too_few_source_hunks":     "too_few_hunks",
+            "missing_source":             "missing_source",
+            "slicing_error":              "slicing_error",
+            "empty_hunks":                "slicing_empty",
+            "too_few_source_hunks":       "too_few_hunks",
+            "too_more_source_hunks":      "too_many_hunks",   # ✅ 补充缺失映射
             "validation_no_dependencies": "no_dependency",
-            "analysis_error":           "analysis_error",
-            "sorting_error":            "sorting_error",
+            "analysis_error":             "analysis_error",
+            "sorting_error":              "sorting_error",
         }
         if stage in stage_map:
             stats["filters"][stage_map[stage]] += 1
@@ -149,10 +153,12 @@ def _print_report(stats: Dict[str, Any]) -> None:
     success_count = stats["total_output"]
     avg_hunks = stats["insights"]["total_hunks"] / success_count if success_count else 0
     avg_deps  = stats["insights"]["total_dependencies"] / success_count if success_count else 0
+    mode_str  = "NO-GRAPH (LLM-filter)" if stats.get("no_graph_mode") else "GRAPH"
 
     report = f"""
 ==================================================
 NEP Dataset Phase 2 Analysis Report (SEQUENTIAL)
+Mode: {mode_str}
 ==================================================
 [Flow]
 Total Input            : {stats['total_input']}
@@ -165,11 +171,12 @@ Loop Exceptions        : {stats['errors']}
 2. Slicing Error       : {stats['filters']['slicing_error']}
 3. Slicing Empty       : {stats['filters']['slicing_empty']}
 4. Too Few Hunks (<2)  : {stats['filters']['too_few_hunks']}
-5. No Dependency       : {stats['filters']['no_dependency']}
-6. Validation Fail     : {stats['filters']['validation_fail']}
-7. Analysis Error      : {stats['filters']['analysis_error']}
-8. Sorting Error       : {stats['filters']['sorting_error']}
-9. UNKNOWN REASON      : {stats['filters']['unknown']}
+5. Too Many Hunks      : {stats['filters']['too_many_hunks']}
+6. No Dependency       : {stats['filters']['no_dependency']}
+7. Validation Fail     : {stats['filters']['validation_fail']}
+8. Analysis Error      : {stats['filters']['analysis_error']}
+9. Sorting Error       : {stats['filters']['sorting_error']}
+10. UNKNOWN REASON     : {stats['filters']['unknown']}
 
 [Dataset Insights]
 Single File            : {stats['insights']['single_file']}
@@ -183,99 +190,94 @@ Avg Edges              : {avg_deps:.2f}
 
 
 # ─────────────────────────────────────────────
-# 主流程
+# 核心函数（供 pipeline 调用）
 # ─────────────────────────────────────────────
 
-def parse_args():
-    p = argparse.ArgumentParser(description="NEP Pipeline — Phase 2: Static Analysis (Resumable)")
-    p.add_argument("--input",     required=True,  help="Phase 1 output (.jsonl or .jsonl.gz)")
-    p.add_argument("--output",    default="output/analyzed.jsonl", help="Output JSONL file path")
-    p.add_argument("--repo_path", required=True,  help="Local path to the git repository")
-    p.add_argument("--reset",     action="store_true", help="Ignore checkpoint and restart from scratch")
-    return p.parse_args()
+def run_phase2(
+    input: str,
+    output: str,
+    repo_path: str,
+    repo_name: str,
+    reset: bool = False,
+    use_graph: bool = True,
+) -> Dict[str, Any]:
+    from datetime import date
+    mode = "graph" if use_graph else "no_graph"
+    output = output or f"output/{repo_name}_{date.today().strftime('%Y-%m-%d')}_phase2_{mode}.jsonl"
 
-
-def main():
-    args       = parse_args()
-
-    output_dir = os.path.dirname(os.path.abspath(args.output))
+    """
+    执行 Phase 2 分析。
+    Returns:
+        最终 stats 字典
+    """
+    output_dir = os.path.dirname(os.path.abspath(output))
     os.makedirs(output_dir, exist_ok=True)
 
-    # ── 加载 / 重置 断点 ──────────────────────────────
-    if args.reset:
-        clear_checkpoint(output_dir)
-        logger.info("[Resume] --reset flag detected, starting from scratch.")
+    if reset:
+        clear_checkpoint(output_dir,repo_name,use_graph)
+        logger.info("[Phase2][Resume] --reset flag detected, starting from scratch.")
 
-    ckpt = load_checkpoint(output_dir)
-    skip_lines: int       = ckpt["processed_lines"]   # 已处理行数，需跳过
-    stats: Dict[str, Any] = ckpt["stats"] or _empty_stats()
-    is_resume: bool       = skip_lines > 0
+    ckpt = load_checkpoint(output_dir,repo_name,use_graph)
+    skip_lines = ckpt["processed_lines"]
+    stats = ckpt["stats"] or _empty_stats()
+    stats["no_graph_mode"] = not use_graph
+    is_resume = skip_lines > 0
 
-    # 续跑时用追加模式，否则用覆盖模式
     write_mode = "a" if is_resume else "w"
     if is_resume:
-        logger.info(f"[Resume] Appending to existing output file (mode='{write_mode}').")
+        logger.info(f"[Phase2][Resume] Appending to existing output (mode='{write_mode}').")
 
-    # ── 初始化 Processor ─────────────────────────────
-    logger.info("Initializing CommitProcessor...")
+    logger.info("[Phase2] Initializing CommitProcessor...")
     try:
-        processor = CommitProcessor(repo_path=args.repo_path)
+        processor = CommitProcessor(repo_path=repo_path, use_graph=use_graph)
+        mode_tag = "NO-GRAPH" if not use_graph else "GRAPH"
+        logger.info(f"[Phase2][Config] Processing mode: {mode_tag}")
     except Exception as e:
-        logger.error(f"Failed to initialize processor: {e}")
-        return
+        logger.error(f"[Phase2] Failed to initialize processor: {e}")
+        return stats
 
-    open_func = gzip.open if args.input.endswith(".gz") else open
+    open_func = gzip.open if input.endswith(".gz") else open
+    logger.info(f"[Phase2] Reading from {input}")
 
-    logger.info(f"Reading from {args.input}")
-    logger.info("Starting sequential processing...")
-
-    # 每处理多少行保存一次 checkpoint（可按需调整）
     CHECKPOINT_INTERVAL = 500
-    processed_this_session = 0   # 本次会话新处理的行数
+    processed_this_session = 0
 
     try:
-        with open_func(args.input, "rt", encoding="utf-8") as f_in, \
-             open(args.output, write_mode, encoding="utf-8") as f_out:
+        with open_func(input, "rt", encoding="utf-8") as f_in, \
+             open(output, write_mode, encoding="utf-8") as f_out:
 
-            pbar = tqdm(f_in, desc="Processing Commits", initial=skip_lines)
+            pbar = tqdm(f_in, desc="[Phase2] Processing Commits", initial=skip_lines)
 
             for raw_line in pbar:
                 line = raw_line.strip()
                 if not line:
                     continue
-
-                # ── 跳过已处理行 ──────────────────────
                 if skip_lines > 0:
                     skip_lines -= 1
                     continue
 
                 stats["total_input"] += 1
-
-                # ── 处理 ──────────────────────────────
                 result_json, local_stats, error_info = process_single_line(line, processor)
 
                 if error_info:
                     stats["errors"] += 1
                     if stats["errors"] <= 5:
-                        logger.error(f"Loop Error: {error_info}")
+                        logger.error(f"[Phase2] Loop Error: {error_info}")
                 elif local_stats["is_success"]:
-                    logger.debug("Analyzing Success")
                     f_out.write(result_json + "\n")
                     _update_stats(stats, local_stats)
                 else:
                     _update_stats(stats, local_stats)
                     stage = local_stats["stage"]
                     if stage == "slicing_error" and stats["filters"]["slicing_error"] <= 5:
-                        logger.error(f"Slicing Error Detail: {local_stats.get('error_msg')}")
+                        logger.error(f"[Phase2] Slicing Error: {local_stats.get('error_msg')}")
 
                 processed_this_session += 1
-                # ckpt 里记录的是「输入文件中已跳过+已处理」的总行数
                 total_processed = ckpt["processed_lines"] + processed_this_session
 
-                # ── 定期保存 checkpoint ───────────────
                 if processed_this_session % CHECKPOINT_INTERVAL == 0:
                     f_out.flush()
-                    save_checkpoint(output_dir, total_processed, stats)
+                    save_checkpoint(output_dir, total_processed, stats,repo_name,use_graph)
                     pbar.set_postfix(
                         out=stats["total_output"],
                         err=stats["errors"],
@@ -283,29 +285,57 @@ def main():
                     )
 
     except FileNotFoundError:
-        logger.error(f"Input file not found: {args.input}")
-        return
+        logger.error(f"[Phase2] Input file not found: {input}")
+        return stats
 
     except KeyboardInterrupt:
-        # ── 中断：保存当前进度 ────────────────────────
         total_processed = ckpt["processed_lines"] + processed_this_session
-        save_checkpoint(output_dir, total_processed, stats)
+        save_checkpoint(output_dir, total_processed, stats,repo_name,use_graph)
         logger.warning(
-            f"\n[Resume] Interrupted! Progress saved at line {total_processed}. "
-            f"Re-run the same command to continue."
+            f"[Phase2] Interrupted! Progress saved at line {total_processed}."
         )
         _print_report(stats)
-        return
+        return stats
 
-    # ── 全部完成：保存最终 stats，清理 checkpoint ────
-    logger.success("Phase 2 Sequential Processing Complete.")
-    clear_checkpoint(output_dir)
+    logger.success("[Phase2] Processing Complete.")
+    clear_checkpoint(output_dir,repo_name,use_graph)
     _print_report(stats)
 
     stats_path = os.path.join(output_dir, "phase2_stats.json")
     with open(stats_path, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
 
+    return stats
 
-if __name__ == "__main__":
-    main()
+
+# ─────────────────────────────────────────────
+# 单独运行入口
+# ─────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description="NEP Pipeline — Phase 2: Static Analysis (Resumable)")
+    p.add_argument("--input",     required=True,  help="Phase 1 output (.jsonl or .jsonl.gz)")
+    p.add_argument("--repo_path", required=True,  help="Local path to the git repository")
+    p.add_argument("--repo_name", required=True, help="仓库短标识符，用于命名输出文件")
+    p.add_argument("--output", default=None, help="Output JSONL file path (default: auto-named)")
+    p.add_argument("--reset",     action="store_true", help="Ignore checkpoint and restart from scratch")
+    p.add_argument(
+        "--no-graph",
+        action="store_true",
+        default=False,
+        help="禁用 GraphDependencyAnalyzerWrapper，跳过依赖分析，供后续 LLM 过滤使用。"
+    )
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    run_phase2(
+        input=args.input,
+        output=args.output,
+        repo_path=args.repo_path,
+        repo_name=args.repo_name,
+        reset=args.reset,
+        use_graph=not args.no_graph,
+    )
+

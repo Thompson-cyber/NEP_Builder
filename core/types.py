@@ -110,7 +110,7 @@ class AnalyzedCommit(BaseModel):
     hash: str
     repo: str
     msg: str
-
+    source_diff: str = ""
     # 关联的 Issue 描述（如果能获取到）
     issue_description: Optional[str] = None
 
