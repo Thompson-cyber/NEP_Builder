@@ -29,8 +29,8 @@ _COMMENT_LINE_PATTERN = re.compile(
 _VALID_PATTERNS = {
     "Refactoring", "Bug Fix", "Enhancement", "New Feature",
     "Config Change",
-    "Refactoring+Bug Fix", "Refactoring+Enhancement",
-    "Enhancement+Bug Fix", "New Feature+Refactoring",
+    "Performance Optimization", "Security Fix", "Deprecation",
+    "Error Handling", "Dependency Update"
 }
 
 
@@ -42,7 +42,7 @@ def _is_comment_only_hunk(hunk: Hunk) -> bool:
     change_lines = [
         line for line in hunk.content.split("\n")
         if line.startswith(("+", "-"))
-        and not line.startswith(("+++", "---"))
+           and not line.startswith(("+++", "---"))
     ]
     if not change_lines:
         return False
@@ -61,7 +61,7 @@ class Stage1Result:
     disqualification_reason: Optional[str]  # "Category X: ..."
     change_pattern: Optional[str]
     requirement_summary: Optional[str]
-    quality_reasoning: str                  # 质量审计推理过程（用于日志）
+    quality_reasoning: str  # 质量审计推理过程（用于日志）
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -109,8 +109,9 @@ class LLMCausalRanker:
             return None
 
         # ── 单 Hunk 早退：无需 LLM ────────────────────────────────────
-        if len(source_hunks) == 1:
-            return self._handle_single_hunk(commit, source_hunks)
+        if len(source_hunks) <= 2:
+            return None
+            # return self._handle_single_hunk(commit, source_hunks)
 
         commit.ordered_hunks = source_hunks
 
@@ -162,7 +163,7 @@ class LLMCausalRanker:
                 model=self.model,
                 messages=[
                     {"role": "system", "content": self._stage1_system_prompt()},
-                    {"role": "user",   "content": prompt},
+                    {"role": "user", "content": prompt},
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.1,
@@ -197,7 +198,7 @@ class LLMCausalRanker:
     # ──────────────────────────────────────────────────────────────────
 
     def _run_stage2(
-        self, commit: AnalyzedCommit, stage1: Stage1Result
+            self, commit: AnalyzedCommit, stage1: Stage1Result
     ) -> Optional[AnalyzedCommit]:
         """
         在 Stage 1 结论的基础上，调用 LLM 完成根因识别与 Hunk 排序。
@@ -212,7 +213,7 @@ class LLMCausalRanker:
                 model=self.model,
                 messages=[
                     {"role": "system", "content": self._stage2_system_prompt()},
-                    {"role": "user",   "content": prompt},
+                    {"role": "user", "content": prompt},
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.1,
@@ -235,9 +236,9 @@ class LLMCausalRanker:
 
             # ── 校验 hunk_order 完整性 ────────────────────────────────
             if (
-                len(hunk_order) != total
-                or set(hunk_order) != set(range(total))
-                or hunk_order[0] != chosen_index
+                    len(hunk_order) != total
+                    or set(hunk_order) != set(range(total))
+                    or hunk_order[0] != chosen_index
             ):
                 logger.warning(
                     f"[{commit.hash[:7]}] [S2] Invalid hunk_order {hunk_order}, "
@@ -301,7 +302,7 @@ class LLMCausalRanker:
     # ──────────────────────────────────────────────────────────────────
 
     def _handle_single_hunk(
-        self, commit: AnalyzedCommit, source_hunks: list
+            self, commit: AnalyzedCommit, source_hunks: list
     ) -> AnalyzedCommit:
         source_hunks[0].order_index = 0
         commit.ordered_hunks = source_hunks
@@ -333,7 +334,7 @@ class LLMCausalRanker:
             "You must identify and reject low-quality commits before any deep analysis occurs. "
             "False positives (letting bad samples through) are far more harmful than "
             "false negatives (rejecting good samples). When in doubt, REJECT. "
-            "Note: test files and comment-only changes have already been pre-filtered."
+            "Note: test files and comment changes need reject."
         )
 
     @staticmethod
@@ -364,6 +365,7 @@ Act as a strict quality gate. Determine whether this commit qualifies as a
 HIGH-QUALITY test set sample, then identify its core intent.
 This dataset is used for model evaluation — be strict, reject anything ambiguous.
 
+NOTE: Only focus on the source file changes.
 ---
 
 ## Input
@@ -377,11 +379,12 @@ This dataset is used for model evaluation — be strict, reject anything ambiguo
 ### Candidate Hunks ({total_hunks} total — test files and comment-only hunks pre-filtered)
 {hunks_display}
 
+
 ---
 
 ## Task A — Quality Pre-Screening
 
-Check ALL six categories. Set `is_analyzable: false` if ANY single condition is met.
+Check ALL three categories. Set `is_analyzable: false` if ANY single condition is met.
 
 ### Category A — Formatting / Style-Only Changes
 Disqualify if the dominant change is purely cosmetic with zero semantic effect:
@@ -402,36 +405,9 @@ with no logic change:
 - Magic number → named constant (behavior unchanged)
 - Spelling correction causing bulk symbol rename
 
-### Category C — Non-Code / Auto-Generated / Metadata Files
-Disqualify if non-logic files dominate the diff:
-- Version-only changes: package.json, go.mod, pom.xml, *.csproj
-- Changelog / release notes: CHANGELOG.md, HISTORY.md, RELEASE_NOTES.*
-- Lock files: package-lock.json, yarn.lock, poetry.lock, Pipfile.lock
-- Auto-generated: *.generated.*, *.pb.go, *_pb2.py, *.min.js,
-  DB migration files, GraphQL schema snapshots
-- Pure documentation: README.md, docs/** (when no logic hunk exists alongside)
-
-### Category D — Degenerate Causal Structure
-Disqualify if the causal chain is trivially simple or has no unique ground truth:
-- ALL hunks are in the same file with no cross-file propagation AND changes
-  are adjacent / sequential with no branching logic
-- ALL inter-hunk relationships are pure mechanical parameter pass-through
-  (adding a parameter at every call-stack layer, no new logic at any layer)
-- Causal order has multiple equally valid permutations (ambiguous ground truth)
-
-### Category E — Semantically Unintelligible Commits
-Disqualify if the commit's intent cannot be reliably inferred:
-- Commit Message is absent, a single generic word, or clearly unrelated to diff
-  (e.g., "fix", "update", "wip", "misc", "temp", ".", "refactor")
-- Commit Message describes multiple unrelated objectives
-- Critical hunks are truncated ("... (truncated)") and missing content is
-  essential to understanding the causal relationship
-- Diff dominated by DSL, config language, or auto-generated code whose
-  semantics cannot be inferred from syntax alone
-
-### Category F — Multi-Requirement Contamination
+### Category C — Multi-Requirement Contamination
 Disqualify if the commit mixes independent concerns:
-- Two or more hunks fix different, unrelated bugs
+- Two or more hunks fix different, unrelated bugs or intent.
 - A feature hunk is mixed with an unrelated cleanup hunk (dead code in a
   different module, unrelated typo fix, unrelated formatting)
 - One hunk updates only version number / changelog / metadata while others
@@ -449,14 +425,13 @@ Set `is_single_requirement: true` ONLY when ALL four hold:
 1. Every hunk serves one unified intent (same bug / feature / refactoring goal)
 2. All hunks are semantically connected through causal or adaptation relationships
    — NO isolated nodes
-3. Commit Message describes a single, coherent change objective
-4. No hunk is a "hitchhiker" (could be committed separately without breaking others)
+3. No hunk is a "hitchhiker" (could be committed separately without breaking others)
 
 ### B2 — Change Pattern Classification
 Classify into exactly one of:
 "Refactoring" | "Bug Fix" | "Enhancement" | "New Feature" | "Config Change" |
-"Refactoring+Bug Fix" | "Refactoring+Enhancement" | "Enhancement+Bug Fix" |
-"New Feature+Refactoring"
+"Performance Optimization" | "Security Fix" | "Deprecation" |
+"Error Handling" | "Dependency Update"
 
 ### B3 — Requirement Summary
 (Only when `is_single_requirement: true`)
@@ -489,7 +464,7 @@ Single JSON object, no Markdown fences, no extra text.
     # ──────────────────────────────────────────────────────────────────
 
     def _build_stage2_prompt(
-        self, commit: AnalyzedCommit, stage1: Stage1Result
+            self, commit: AnalyzedCommit, stage1: Stage1Result
     ) -> str:
         total_hunks = len(commit.ordered_hunks)
         hunk_id_to_index = {h.id: i for i, h in enumerate(commit.ordered_hunks)}
@@ -504,6 +479,7 @@ A commit has passed quality screening. Reconstruct the developer's causal
 reasoning chain with precision: identify the Root Cause Hunk and model the
 modification order of all hunks.
 
+NOTE: Only focus on the source file changes.
 ---
 
 ## Pre-established Context (from Quality Gate — treat as ground truth)
@@ -526,8 +502,8 @@ Every reasoning step should be grounded in this established intent.
 ### Candidate Hunks ({total_hunks} total)
 {hunks_display}
 
-### Static Dependency Information
-{dependency_text}
+
+
 
 ---
 
@@ -545,7 +521,11 @@ Given the confirmed change pattern **{stage1.change_pattern}**, apply:
 | Enhancement          | Extends the primary abstraction or core logic    | Interface / wiring / routing updates   |
 | New Feature          | Introduces the core new logic                    | Registration / routing / adapter hunks |
 | Config Change        | Modifies the core configuration entry            | Reader-side adaptations                |
-| Composite (X+Y)      | Prioritize the fix/enhancement intent            | Structural reorganization hunks        |
+| Performance Optimization   | Replaces the bottleneck algorithm, data structure, or I/O pattern                    | Adjusts callers to match new API contract or data shape                      |
+| Security Fix               | Removes or neutralizes the vulnerable code path                                      | Adds / tightens validation, sanitization, or auth checks at entry points     |
+| Deprecation / Removal      | Deletes the deprecated definition or feature flag                                    | Removes all call sites, references, and dead branches                        |
+| Error Handling             | Adds or corrects the fault-tolerance boundary (try/catch, guard, retry)              | Propagates new error type / return value to upstream callers                 |
+| Dependency Update          | Bumps the dependency version or swaps the library                                    | Adapts call sites to new API surface or changed behavior                     |
 
 #### Universal Positive Signals
 - Introduces a new symbol (function, class, constant, type) referenced by others → Root
@@ -617,7 +597,7 @@ Single JSON object, no Markdown fences, no extra text.
             lines = hunk.content.split("\n")
             if len(lines) > self.max_diff_lines:
                 content_snippet = (
-                    "\n".join(lines[: self.max_diff_lines]) + "\n... (truncated)"
+                        "\n".join(lines[: self.max_diff_lines]) + "\n... (truncated)"
                 )
             else:
                 content_snippet = "\n".join(lines)
@@ -632,7 +612,7 @@ File: {hunk.file_path} (Lines {hunk.start_line}-{hunk.end_line})
         return result
 
     def _format_dependency_chains(
-        self, chains: List[Any], hunk_id_to_index: Dict[str, int]
+            self, chains: List[Any], hunk_id_to_index: Dict[str, int]
     ) -> str:
         if not chains:
             return "No explicit static dependencies detected between these hunks."

@@ -23,19 +23,19 @@ from stage1_collect_commits import run_phase1
 from stage2_call_graph_analysis import run_phase2
 
 # ── 仓库列表 ──────────────────────────────────────────────────────────────────
-REPOS_BASE = r"D:\Data\2025\CodeCompletion\Dataset\Repos\all_repos"
+REPOS_BASE = r"D:\Data\2025\CodeCompletion\Dataset\Repos\all_repos\repos"
 OUTPUT_BASE = r"D:\Data\2025\CodeCompletion\Dataset\Outputs\re_collected_phase1&2"
 
 REPOS = {
     "Python": [
-        "transformers",
-        "django",
+        # "transformers",
+        # "django",
         "fastapi",
         "core",
         "sherlock",
         "yt-dlp",
         "ComfyUI",
-        "pytorch",
+        # "pytorch",
     ],
     "Go": [
         "ollama",
@@ -51,8 +51,8 @@ REPOS = {
     ],
     "Java": [
         "spring-boot",
-        "elasticsearch",
-        "guava",
+        # "elasticsearch",
+        # "guava",
         "dbeaver",
         "RxJava",
         "jadx",
@@ -69,7 +69,7 @@ REPOS = {
         "nest",
         "strapi",
         "n8n",
-        "ionic-framework",
+        # "ionic-framework",
         "Flowise",
         "DefinitelyTyped",
     ],
