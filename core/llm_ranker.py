@@ -1,5 +1,6 @@
 import json
 import os
+import re
 
 import openai
 from typing import List, Optional, Dict, Any
@@ -7,6 +8,44 @@ from loguru import logger
 from core.types import AnalyzedCommit, Hunk, LLMAnalysisResult
 from config.settings import MiningConfig
 
+_TEST_PATH_PATTERNS = re.compile(
+    r"(^|[\\/])(test|tests|spec|specs|__tests__|__mocks__)[\\/]"
+    r"|[\\/](test|spec)s?[\\/]"
+    r"|\.(test|spec)\.(ts|tsx|js|jsx|py|java|go|rb|cs)$"
+    r"|(^|[\\/])(conftest|setup_tests?|test_utils?)\.",
+    re.IGNORECASE,
+)
+
+_COMMENT_LINE_PATTERN = re.compile(
+    r"^[+-]\s*(//|#|/\*|\*|<!--|\"\"\"|''')"
+)
+
+_VALID_PATTERNS = {
+    "Refactoring", "Bug Fix", "Enhancement", "New Feature",
+    "Config Change",
+    "Refactoring+Bug Fix", "Refactoring+Enhancement",
+    "Enhancement+Bug Fix", "New Feature+Refactoring",
+}
+
+
+def _is_test_hunk(hunk: Hunk) -> bool:
+    """Determine whether a hunk belongs to a test file."""
+    return bool(_TEST_PATH_PATTERNS.search(hunk.file_path))
+
+
+def _is_comment_only_hunk(hunk: Hunk) -> bool:
+    """
+    Determine whether a hunk contains only comment changes.
+    Strategy: if all meaningful change lines (+/-) are comment lines, treat as comment-only.
+    """
+    change_lines = [
+        line for line in hunk.content.split("\n")
+        if line.startswith(("+", "-"))
+        and not line.startswith(("+++", "---"))
+    ]
+    if not change_lines:
+        return False
+    return all(_COMMENT_LINE_PATTERN.match(line) for line in change_lines)
 
 class LLMCausalRanker:
     """
@@ -30,14 +69,36 @@ class LLMCausalRanker:
         分析 commit，返回排序后的 AnalyzedCommit。
         若 LLM 判断不是单一需求，或置信度不足，返回 None。
         """
+        # ── Pre-filter: remove test files and comment-only hunks ──────
+        source_hunks = [
+            h for h in commit.ordered_hunks
+            if not _is_test_hunk(h) and not _is_comment_only_hunk(h)
+        ]
 
-        # ── 预检查：单 Hunk 直接返回 ──────────────────────────────────
-        if len(commit.ordered_hunks) == 1:
-            commit.ordered_hunks[0].order_index = 0
+        filtered_count = len(commit.ordered_hunks) - len(source_hunks)
+        if filtered_count > 0:
+            logger.debug(
+                f"[{commit.hash[:7]}] Filtered out {filtered_count} test/comment hunk(s), "
+                f"{len(source_hunks)} valid hunk(s) remaining."
+            )
+
+        if not source_hunks:
+            logger.info(f"[{commit.hash[:7]}] No valid hunks after filtering, skipping.")
+            return None
+
+        # ── Early exit: single hunk requires no ranking ───────────────
+        if len(source_hunks) == 1:
+            source_hunks[0].order_index = 0
+            commit.ordered_hunks = source_hunks
             commit.causal_analysis = LLMAnalysisResult(
-                root_hunk_id=commit.ordered_hunks[0].id,
+                root_hunk_id=source_hunks[0].id,
                 confidence=1.0,
-                reasoning="Single hunk commit.",
+                reasoning=json.dumps({
+                    "root_cause": "Only one valid hunk after filtering.",
+                    "coherence_check": "Single hunk — coherence check not applicable.",
+                    "summary_basis": "Derived directly from commit message.",
+                    "order_rationale": "Single hunk — ordering not applicable."
+                }),
                 change_pattern="Unknown",
                 is_single_requirement=True,
                 requirement_summary=commit.msg,
@@ -57,9 +118,11 @@ class LLMCausalRanker:
                         "role": "system",
                         "content": (
                             "You are a Senior Code Archaeologist. "
-                            "Your task is to reconstruct the developer's thought process, "
-                            "identify the Root Cause Hunk, judge requirement coherence, "
-                            "generate a requirement summary, and model the hunk modification order."
+                            "Your task is to reconstruct the developer's thought process "
+                            "using only code semantics and commit message — no static dependency graph is available. "
+                            "Identify the Root Cause Hunk, judge requirement coherence, "
+                            "generate a requirement summary, and model the hunk modification order. "
+                            "Note: ignore the test files and comment-only changes."
                         )
                     },
                     {"role": "user", "content": prompt}
@@ -71,63 +134,81 @@ class LLMCausalRanker:
             content = response.choices[0].message.content
             result_data = json.loads(content)
 
-            # ── Task 2：非单一需求直接丢弃 ────────────────────────────
+            # ── Task 2: discard non-single-requirement commits ────────
             is_single = result_data.get("is_single_requirement", False)
             if not is_single:
+                reasoning_obj = result_data.get("reasoning", {})
+                coherence_msg = (
+                    reasoning_obj.get("coherence_check", "")
+                    if isinstance(reasoning_obj, dict)
+                    else str(reasoning_obj)
+                )
                 logger.info(
-                    f"Commit {commit.hash[:7]} discarded: not a single requirement. "
-                    f"Reasoning: {result_data.get('reasoning', '')[:120]}"
+                    f"[{commit.hash[:7]}] Discarded: not a single requirement. "
+                    f"Reason: {coherence_msg[:120]}"
                 )
                 return None
 
-            # ── 解析其余字段 ──────────────────────────────────────────
+            # ── Parse remaining fields ────────────────────────────────
             chosen_index = int(result_data.get("root_hunk_index", -1))
             hunk_order: List[int] = result_data.get("hunk_order", [])
             requirement_summary: Optional[str] = result_data.get("requirement_summary", None)
             confidence = float(result_data.get("confidence_score", 0.0))
-            change_pattern = result_data.get("change_pattern", "Unknown")
-            reasoning = result_data.get("reasoning", "")
-            total = len(commit.ordered_hunks)
+            reasoning = result_data.get("reasoning", {})
+            total = len(source_hunks)
 
-            # ── 校验 root_hunk_index ──────────────────────────────────
+            # ── Validate and normalize change_pattern ─────────────────
+            raw_pattern = result_data.get("change_pattern", "Unknown")
+            change_pattern = (
+                raw_pattern if raw_pattern in _VALID_PATTERNS else "Unknown"
+            )
+            if change_pattern == "Unknown":
+                logger.warning(
+                    f"[{commit.hash[:7]}] Unknown change_pattern '{raw_pattern}', "
+                    f"falling back to Unknown."
+                )
+
+            # ── Validate root_hunk_index ──────────────────────────────
             if not (0 <= chosen_index < total):
                 logger.warning(
-                    f"LLM returned invalid root_hunk_index {chosen_index} "
-                    f"for {commit.hash[:7]}, discarding."
+                    f"[{commit.hash[:7]}] Invalid root_hunk_index {chosen_index}, discarding."
                 )
                 return None
 
-            # ── 校验 hunk_order 完整性 ────────────────────────────────
+            # ── Validate hunk_order completeness ─────────────────────
             if (
                     len(hunk_order) != total
                     or set(hunk_order) != set(range(total))
                     or hunk_order[0] != chosen_index
             ):
                 logger.warning(
-                    f"LLM returned invalid hunk_order {hunk_order} "
-                    f"for {commit.hash[:7]}, falling back to root-first order."
+                    f"[{commit.hash[:7]}] Invalid hunk_order {hunk_order}, "
+                    f"falling back to root-first order."
                 )
-                # 降级：root 排第一，其余保持原顺序
                 hunk_order = [chosen_index] + [i for i in range(total) if i != chosen_index]
 
-            root_hunk = commit.ordered_hunks[chosen_index]
+            root_hunk = source_hunks[chosen_index]
 
-            # ── 保存 LLM 分析结果 ─────────────────────────────────────
+            # Serialize reasoning dict to string for storage
+            reasoning_str = (
+                json.dumps(reasoning, ensure_ascii=False)
+                if isinstance(reasoning, dict)
+                else str(reasoning)
+            )
+
+            # ── Save LLM analysis result ──────────────────────────────
             commit.causal_analysis = LLMAnalysisResult(
                 root_hunk_id=root_hunk.id,
                 confidence=confidence,
-                reasoning=reasoning,
+                reasoning=reasoning_str,
                 change_pattern=change_pattern,
                 is_single_requirement=True,
                 requirement_summary=requirement_summary,
                 hunk_order=hunk_order
             )
 
-            # ── 按 hunk_order 重排 ordered_hunks ─────────────────────
-            original_hunks = list(commit.ordered_hunks)
-            commit.ordered_hunks = [original_hunks[i] for i in hunk_order]
-
-            # 更新每个 hunk 的物理位置索引
+            # ── Reorder hunks by hunk_order ───────────────────────────
+            commit.ordered_hunks = [source_hunks[i] for i in hunk_order]
             for position, hunk in enumerate(commit.ordered_hunks):
                 hunk.order_index = position
 
@@ -138,10 +219,10 @@ class LLMCausalRanker:
             )
 
         except json.JSONDecodeError as e:
-            logger.error(f"JSON parse failed for {commit.hash[:7]}: {e}")
+            logger.error(f"[{commit.hash[:7]}] JSON parse failed: {e}")
             return None
         except Exception as e:
-            logger.error(f"LLM analysis failed for {commit.hash[:7]}: {e}")
+            logger.error(f"[{commit.hash[:7]}] LLM analysis failed: {e}")
             return None
 
         return commit
