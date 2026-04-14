@@ -23,16 +23,16 @@ from stage1_collect_commits import run_phase1
 from stage2_call_graph_analysis import run_phase2
 
 # ── 仓库列表 ──────────────────────────────────────────────────────────────────
-REPOS_BASE = "/home/data/yibowang/multi_completion_datas/repos"
-OUTPUT_BASE = "/home/data/yibowang/multi_completion_datas/data_collection/"
+REPOS_BASE = r"D:\Data\2025\CodeCompletion\Dataset\Repos\all_repos"
+OUTPUT_BASE = r"D:\Data\2025\CodeCompletion\Dataset\Outputs\re_collected_phase1&2"
 
 REPOS = {
     "Python": [
-        # "transformers",
-        # "django",
-        # "fastapi",
-        # "core",
-        # "sherlock",
+        "transformers",
+        "django",
+        "fastapi",
+        "core",
+        "sherlock",
         "yt-dlp",
         "ComfyUI",
         "pytorch",

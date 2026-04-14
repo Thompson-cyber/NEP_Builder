@@ -42,6 +42,6 @@ class MiningConfig:
     LLM_API_KEY: str = os.environ.get("LLM_API_KEY", "")
     LLM_BASE_URL: str = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com")
     LLM_MODEL: str = os.environ.get("LLM_MODEL", "deepseek-reasoner")
-    LLM_MAX_DIFF_LINES: int = int(os.environ.get("LLM_MAX_DIFF_LINES", "5000"))
+    LLM_MAX_DIFF_LINES: int = int(os.environ.get("LLM_MAX_DIFF_LINES", "500000"))
 
     USE_LLM = False

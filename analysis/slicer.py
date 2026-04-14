@@ -94,6 +94,8 @@ class DiffSlicer:
         if not lines:
             return
 
+        CONTEXT_LINES = 3  # 前后上下文行数，可配置
+
         # ── 第一阶段：预计算每行的行号偏移 ──────────────────────────────
         old_offsets = []
         new_offsets = []
@@ -109,48 +111,62 @@ class DiffSlicer:
                 old_off += 1
                 new_off += 1
 
-        # ── 第二阶段：识别连续变更簇 ─────────────────────────────────────
-        # 规则：连续的 +/- 行为同一簇，任何上下文行（空格）立即切断
-        clusters = []  # 每个元素: {'start_idx': int, 'lines': List[str]}
-
+        # ── 第二阶段：识别纯变更簇 ───────────────────────────────────────
+        # 每个簇记录: {'start_idx': int, 'end_idx': int}
+        clusters = []
         current_cluster = None
+
         for idx, line in enumerate(lines):
             if line.startswith('+') or line.startswith('-'):
                 if current_cluster is None:
-                    # 开启新簇，记录起始索引（用于查偏移）
-                    current_cluster = {'start_idx': idx, 'lines': []}
-                current_cluster['lines'].append(line)
+                    current_cluster = {'start_idx': idx, 'end_idx': idx}
+                else:
+                    current_cluster['end_idx'] = idx
             else:
-                # 上下文行或其他行：立即切断当前簇
                 if current_cluster is not None:
                     clusters.append(current_cluster)
                     current_cluster = None
 
-        # 收尾：处理最后一个簇（diff 末尾没有上下文行的情况）
         if current_cluster is not None:
             clusters.append(current_cluster)
 
-        # ── 第三阶段：按簇生成 Hunk ──────────────────────────────────────
-        for cluster in clusters:
-            start_idx = cluster['start_idx']
-            cluster_lines = cluster['lines']
+        if not clusters:
+            return
 
-            # 用预计算的偏移得到该簇在文件中的绝对起始行号
-            final_old_start = meta['old_start'] + old_offsets[start_idx]
-            final_new_start = meta['new_start'] + new_offsets[start_idx]
+        # ── 第三阶段：为每个簇计算上下文窗口，生成 Hunk ─────────────────
+        for i, cluster in enumerate(clusters):
+            s = cluster['start_idx']
+            e = cluster['end_idx']
 
-            calc_old_len = 0
-            calc_new_len = 0
-            for line in cluster_lines:
-                if line.startswith('-'):
-                    calc_old_len += 1
-                elif line.startswith('+'):
-                    calc_new_len += 1
+            # 前窗口：不越过上一个簇的末尾
+            if i > 0:
+                prev_end = clusters[i - 1]['end_idx']
+                ctx_start = max(s - CONTEXT_LINES, prev_end + 1)
+            else:
+                ctx_start = max(s - CONTEXT_LINES, 0)
+
+            # 后窗口：不越过下一个簇的起始
+            if i < len(clusters) - 1:
+                next_start = clusters[i + 1]['start_idx']
+                ctx_end = min(e + CONTEXT_LINES, next_start - 1)
+            else:
+                ctx_end = min(e + CONTEXT_LINES, len(lines) - 1)
+
+            # 提取该 Hunk 的完整行（变更行 + 前后上下文）
+            hunk_lines = lines[ctx_start: ctx_end + 1]
+
+            # start_line 指向第一个变更行（不是上下文起始）
+            final_old_start = meta['old_start'] + old_offsets[s]
+            final_new_start = meta['new_start'] + new_offsets[s]
+
+            # len 只统计变更行（不含上下文）
+            calc_old_len = sum(1 for line in lines[s: e + 1] if line.startswith('-'))
+            calc_new_len = sum(1 for line in lines[s: e + 1] if line.startswith('+'))
 
             hunk = Hunk(
                 id=f"{file_path}:{final_new_start}",
                 file_path=file_path,
-                content="\n".join(cluster_lines),
+                content="\n".join(hunk_lines),
                 old_start_line=final_old_start,
                 old_len=calc_old_len,
                 new_start_line=final_new_start,

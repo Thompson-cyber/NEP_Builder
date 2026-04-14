@@ -1,12 +1,18 @@
 import json
 import os
 import re
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any
 
 import openai
-from typing import List, Optional, Dict, Any
 from loguru import logger
+
 from core.types import AnalyzedCommit, Hunk, LLMAnalysisResult
 from config.settings import MiningConfig
+
+# ══════════════════════════════════════════════════════════════════════════
+# 全局常量（保持不变）
+# ══════════════════════════════════════════════════════════════════════════
 
 _TEST_PATH_PATTERNS = re.compile(
     r"(^|[\\/])(test|tests|spec|specs|__tests__|__mocks__)[\\/]"
@@ -29,15 +35,10 @@ _VALID_PATTERNS = {
 
 
 def _is_test_hunk(hunk: Hunk) -> bool:
-    """Determine whether a hunk belongs to a test file."""
     return bool(_TEST_PATH_PATTERNS.search(hunk.file_path))
 
 
 def _is_comment_only_hunk(hunk: Hunk) -> bool:
-    """
-    Determine whether a hunk contains only comment changes.
-    Strategy: if all meaningful change lines (+/-) are comment lines, treat as comment-only.
-    """
     change_lines = [
         line for line in hunk.content.split("\n")
         if line.startswith(("+", "-"))
@@ -47,13 +48,31 @@ def _is_comment_only_hunk(hunk: Hunk) -> bool:
         return False
     return all(_COMMENT_LINE_PATTERN.match(line) for line in change_lines)
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# Stage 1 结果数据类
+# ══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Stage1Result:
+    """Stage 1 质量门控与意图识别的结构化结果"""
+    is_analyzable: bool
+    is_single_requirement: bool
+    disqualification_reason: Optional[str]  # "Category X: ..."
+    change_pattern: Optional[str]
+    requirement_summary: Optional[str]
+    quality_reasoning: str                  # 质量审计推理过程（用于日志）
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Two-Stage LLM Causal Ranker
+# ══════════════════════════════════════════════════════════════════════════
+
 class LLMCausalRanker:
     """
-    利用 LLM 结合 Issue、Commit Message 和静态依赖图数据，完成四项任务：
-      1. 识别根因 Hunk（Root Cause Hunk）
-      2. 判断所有 Hunks 是否协同解决同一个需求
-      3. 若是同一需求，生成简短的需求摘要
-      4. 建模其他 Hunks 的修改先后顺序（以 Root 为起点的传播链路）
+    两阶段 LLM 因果分析器：
+      Stage 1 — 质量门控 & 意图识别（过滤低质量 Commit，识别变更类型和需求摘要）
+      Stage 2 — 根因识别 & Hunk 排序（以 Stage 1 结论为锚点，深度推理因果链）
     """
 
     def __init__(self, config: MiningConfig):
@@ -64,180 +83,559 @@ class LLMCausalRanker:
         self.model = config.LLM_MODEL
         self.max_diff_lines = config.LLM_MAX_DIFF_LINES
 
+    # ──────────────────────────────────────────────────────────────────
+    # 主入口
+    # ──────────────────────────────────────────────────────────────────
+
     def rank_commit(self, commit: AnalyzedCommit) -> Optional[AnalyzedCommit]:
         """
-        分析 commit，返回排序后的 AnalyzedCommit。
-        若 LLM 判断不是单一需求，或置信度不足，返回 None。
+        两阶段分析 commit，返回排序后的 AnalyzedCommit。
+        任意阶段不通过则返回 None。
         """
-        # ── Pre-filter: remove test files and comment-only hunks ──────
+        # ── 预过滤：移除测试文件和纯注释 Hunk ────────────────────────
         source_hunks = [
             h for h in commit.ordered_hunks
             if not _is_test_hunk(h) and not _is_comment_only_hunk(h)
         ]
-
         filtered_count = len(commit.ordered_hunks) - len(source_hunks)
         if filtered_count > 0:
             logger.debug(
-                f"[{commit.hash[:7]}] Filtered out {filtered_count} test/comment hunk(s), "
-                f"{len(source_hunks)} valid hunk(s) remaining."
+                f"[{commit.hash[:7]}] Filtered {filtered_count} test/comment "
+                f"hunk(s), {len(source_hunks)} remaining."
             )
 
         if not source_hunks:
-            logger.info(f"[{commit.hash[:7]}] No valid hunks after filtering, skipping.")
+            logger.info(f"[{commit.hash[:7]}] No valid hunks after filtering.")
             return None
 
-        # ── Early exit: single hunk requires no ranking ───────────────
+        # ── 单 Hunk 早退：无需 LLM ────────────────────────────────────
         if len(source_hunks) == 1:
-            source_hunks[0].order_index = 0
-            commit.ordered_hunks = source_hunks
-            commit.causal_analysis = LLMAnalysisResult(
-                root_hunk_id=source_hunks[0].id,
-                confidence=1.0,
-                reasoning=json.dumps({
-                    "root_cause": "Only one valid hunk after filtering.",
-                    "coherence_check": "Single hunk — coherence check not applicable.",
-                    "summary_basis": "Derived directly from commit message.",
-                    "order_rationale": "Single hunk — ordering not applicable."
-                }),
-                change_pattern="Unknown",
-                is_single_requirement=True,
-                requirement_summary=commit.msg,
-                hunk_order=[0]
+            return self._handle_single_hunk(commit, source_hunks)
+
+        commit.ordered_hunks = source_hunks
+
+        # ══════════════════════════════════════════════════════════════
+        # Stage 1: Quality Gate & Intent Recognition
+        # ══════════════════════════════════════════════════════════════
+        stage1 = self._run_stage1(commit)
+        if stage1 is None:
+            # LLM 调用或解析失败
+            return None
+
+        if not stage1.is_analyzable:
+            logger.info(
+                f"[{commit.hash[:7]}] [S1] Disqualified — "
+                f"{stage1.disqualification_reason}"
             )
-            return commit
+            return None
 
-        # ── 构造 Prompt ───────────────────────────────────────────────
-        prompt = self._build_prompt(commit)
+        if not stage1.is_single_requirement:
+            logger.info(
+                f"[{commit.hash[:7]}] [S1] Not single requirement — "
+                f"{stage1.quality_reasoning[:120]}"
+            )
+            return None
 
+        logger.debug(
+            f"[{commit.hash[:7]}] [S1] ✓ Passed | "
+            f"Pattern={stage1.change_pattern} | "
+            f"Summary={stage1.requirement_summary}"
+        )
+
+        # ══════════════════════════════════════════════════════════════
+        # Stage 2: Root Cause Identification & Hunk Ordering
+        # ══════════════════════════════════════════════════════════════
+        return self._run_stage2(commit, stage1)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Stage 1 实现
+    # ──────────────────────────────────────────────────────────────────
+
+    def _run_stage1(self, commit: AnalyzedCommit) -> Optional[Stage1Result]:
+        """
+        调用 LLM 完成质量门控与意图识别。
+        失败时返回 None。
+        """
+        prompt = self._build_stage1_prompt(commit)
         try:
-            # ── 调用 LLM ─────────────────────────────────────────────
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a Senior Code Archaeologist. "
-                            "Your task is to reconstruct the developer's thought process "
-                            "using only code semantics and commit message — no static dependency graph is available. "
-                            "Identify the Root Cause Hunk, judge requirement coherence, "
-                            "generate a requirement summary, and model the hunk modification order. "
-                            "Note: ignore the test files and comment-only changes."
-                        )
-                    },
-                    {"role": "user", "content": prompt}
+                    {"role": "system", "content": self._stage1_system_prompt()},
+                    {"role": "user",   "content": prompt},
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.1
+                temperature=0.1,
+            )
+            data = json.loads(response.choices[0].message.content)
+
+            reasoning = data.get("reasoning", {})
+            quality_reasoning = (
+                reasoning.get("quality_audit", "")
+                if isinstance(reasoning, dict)
+                else str(reasoning)
             )
 
-            content = response.choices[0].message.content
-            result_data = json.loads(content)
+            return Stage1Result(
+                is_analyzable=bool(data.get("is_analyzable", False)),
+                is_single_requirement=bool(data.get("is_single_requirement", False)),
+                disqualification_reason=data.get("disqualification_reason"),
+                change_pattern=data.get("change_pattern"),
+                requirement_summary=data.get("requirement_summary"),
+                quality_reasoning=quality_reasoning,
+            )
 
-            # ── Task 2: discard non-single-requirement commits ────────
-            is_single = result_data.get("is_single_requirement", False)
-            if not is_single:
-                reasoning_obj = result_data.get("reasoning", {})
-                coherence_msg = (
-                    reasoning_obj.get("coherence_check", "")
-                    if isinstance(reasoning_obj, dict)
-                    else str(reasoning_obj)
-                )
-                logger.info(
-                    f"[{commit.hash[:7]}] Discarded: not a single requirement. "
-                    f"Reason: {coherence_msg[:120]}"
+        except json.JSONDecodeError as e:
+            logger.error(f"[{commit.hash[:7]}] [S1] JSON parse failed: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"[{commit.hash[:7]}] [S1] LLM call failed: {e}")
+            return None
+
+    # ──────────────────────────────────────────────────────────────────
+    # Stage 2 实现
+    # ──────────────────────────────────────────────────────────────────
+
+    def _run_stage2(
+        self, commit: AnalyzedCommit, stage1: Stage1Result
+    ) -> Optional[AnalyzedCommit]:
+        """
+        在 Stage 1 结论的基础上，调用 LLM 完成根因识别与 Hunk 排序。
+        失败或校验不通过时返回 None。
+        """
+        source_hunks = commit.ordered_hunks
+        total = len(source_hunks)
+        prompt = self._build_stage2_prompt(commit, stage1)
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._stage2_system_prompt()},
+                    {"role": "user",   "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+            )
+            data = json.loads(response.choices[0].message.content)
+
+            # ── 解析核心字段 ──────────────────────────────────────────
+            chosen_index = int(data.get("root_hunk_index", -1))
+            hunk_order: List[int] = data.get("hunk_order", [])
+            confidence = float(data.get("confidence_score", 0.0))
+            reasoning = data.get("reasoning", {})
+
+            # ── 校验 root_hunk_index ──────────────────────────────────
+            if not (0 <= chosen_index < total):
+                logger.warning(
+                    f"[{commit.hash[:7]}] [S2] Invalid root_hunk_index "
+                    f"{chosen_index}, discarding."
                 )
                 return None
 
-            # ── Parse remaining fields ────────────────────────────────
-            chosen_index = int(result_data.get("root_hunk_index", -1))
-            hunk_order: List[int] = result_data.get("hunk_order", [])
-            requirement_summary: Optional[str] = result_data.get("requirement_summary", None)
-            confidence = float(result_data.get("confidence_score", 0.0))
-            reasoning = result_data.get("reasoning", {})
-            total = len(source_hunks)
+            # ── 校验 hunk_order 完整性 ────────────────────────────────
+            if (
+                len(hunk_order) != total
+                or set(hunk_order) != set(range(total))
+                or hunk_order[0] != chosen_index
+            ):
+                logger.warning(
+                    f"[{commit.hash[:7]}] [S2] Invalid hunk_order {hunk_order}, "
+                    f"falling back to root-first order."
+                )
+                hunk_order = [chosen_index] + [
+                    i for i in range(total) if i != chosen_index
+                ]
 
-            # ── Validate and normalize change_pattern ─────────────────
-            raw_pattern = result_data.get("change_pattern", "Unknown")
+            # ── change_pattern：Stage 2 可在 Stage 1 基础上细化 ───────
+            raw_pattern = data.get("change_pattern", stage1.change_pattern or "Unknown")
             change_pattern = (
                 raw_pattern if raw_pattern in _VALID_PATTERNS else "Unknown"
             )
-            if change_pattern == "Unknown":
+            if change_pattern == "Unknown" and raw_pattern != "Unknown":
                 logger.warning(
-                    f"[{commit.hash[:7]}] Unknown change_pattern '{raw_pattern}', "
-                    f"falling back to Unknown."
+                    f"[{commit.hash[:7]}] [S2] Unknown change_pattern "
+                    f"'{raw_pattern}', falling back to Unknown."
                 )
-
-            # ── Validate root_hunk_index ──────────────────────────────
-            if not (0 <= chosen_index < total):
-                logger.warning(
-                    f"[{commit.hash[:7]}] Invalid root_hunk_index {chosen_index}, discarding."
-                )
-                return None
-
-            # ── Validate hunk_order completeness ─────────────────────
-            if (
-                    len(hunk_order) != total
-                    or set(hunk_order) != set(range(total))
-                    or hunk_order[0] != chosen_index
-            ):
-                logger.warning(
-                    f"[{commit.hash[:7]}] Invalid hunk_order {hunk_order}, "
-                    f"falling back to root-first order."
-                )
-                hunk_order = [chosen_index] + [i for i in range(total) if i != chosen_index]
 
             root_hunk = source_hunks[chosen_index]
-
-            # Serialize reasoning dict to string for storage
             reasoning_str = (
                 json.dumps(reasoning, ensure_ascii=False)
                 if isinstance(reasoning, dict)
                 else str(reasoning)
             )
 
-            # ── Save LLM analysis result ──────────────────────────────
+            # ── 写入分析结果 ──────────────────────────────────────────
             commit.causal_analysis = LLMAnalysisResult(
                 root_hunk_id=root_hunk.id,
                 confidence=confidence,
                 reasoning=reasoning_str,
                 change_pattern=change_pattern,
                 is_single_requirement=True,
-                requirement_summary=requirement_summary,
-                hunk_order=hunk_order
+                requirement_summary=stage1.requirement_summary,
+                hunk_order=hunk_order,
             )
 
-            # ── Reorder hunks by hunk_order ───────────────────────────
+            # ── 按 hunk_order 重排 ────────────────────────────────────
             commit.ordered_hunks = [source_hunks[i] for i in hunk_order]
             for position, hunk in enumerate(commit.ordered_hunks):
                 hunk.order_index = position
 
             logger.info(
-                f"[{commit.hash[:7]}] Root: Hunk#{chosen_index} ({root_hunk.id}) | "
-                f"Order: {hunk_order} | Score: {confidence:.2f} | "
-                f"Pattern: {change_pattern} | Summary: {requirement_summary}"
+                f"[{commit.hash[:7]}] [S2] ✓ Root=Hunk#{chosen_index} "
+                f"({root_hunk.id}) | Order={hunk_order} | "
+                f"Score={confidence:.2f} | Pattern={change_pattern} | "
+                f"Summary={stage1.requirement_summary}"
             )
+            return commit
 
         except json.JSONDecodeError as e:
-            logger.error(f"[{commit.hash[:7]}] JSON parse failed: {e}")
+            logger.error(f"[{commit.hash[:7]}] [S2] JSON parse failed: {e}")
             return None
         except Exception as e:
-            logger.error(f"[{commit.hash[:7]}] LLM analysis failed: {e}")
+            logger.error(f"[{commit.hash[:7]}] [S2] LLM call failed: {e}")
             return None
 
+    # ──────────────────────────────────────────────────────────────────
+    # 单 Hunk 处理（无需 LLM）
+    # ──────────────────────────────────────────────────────────────────
+
+    def _handle_single_hunk(
+        self, commit: AnalyzedCommit, source_hunks: list
+    ) -> AnalyzedCommit:
+        source_hunks[0].order_index = 0
+        commit.ordered_hunks = source_hunks
+        commit.causal_analysis = LLMAnalysisResult(
+            root_hunk_id=source_hunks[0].id,
+            confidence=1.0,
+            reasoning=json.dumps({
+                "root_cause": "Only one valid hunk after filtering.",
+                "coherence_check": "Single hunk — not applicable.",
+                "summary_basis": "Derived directly from commit message.",
+                "order_rationale": "Single hunk — not applicable.",
+            }),
+            change_pattern="Unknown",
+            is_single_requirement=True,
+            requirement_summary=commit.msg,
+            hunk_order=[0],
+        )
         return commit
 
     # ──────────────────────────────────────────────────────────────────
-    # 内部辅助方法
+    # System Prompts
     # ──────────────────────────────────────────────────────────────────
 
-    def _format_dependency_chains(
-            self, chains: List[Any], hunk_id_to_index: Dict[str, int]
+    @staticmethod
+    def _stage1_system_prompt() -> str:
+        return (
+            "You are a Dataset Quality Auditor specializing in code change analysis. "
+            "Your job is to act as a strict quality gate for a high-value evaluation dataset. "
+            "You must identify and reject low-quality commits before any deep analysis occurs. "
+            "False positives (letting bad samples through) are far more harmful than "
+            "false negatives (rejecting good samples). When in doubt, REJECT. "
+            "Note: test files and comment-only changes have already been pre-filtered."
+        )
+
+    @staticmethod
+    def _stage2_system_prompt() -> str:
+        return (
+            "You are a Senior Code Archaeologist. "
+            "A commit has already passed strict quality screening and is confirmed to "
+            "address a single, well-defined requirement. "
+            "Your sole task is to reconstruct the developer's causal reasoning chain: "
+            "identify the Root Cause Hunk (the logical origin of the change propagation) "
+            "and model the modification order of all hunks. "
+            "The requirement context from the quality gate is your semantic anchor — "
+            "use it to reason precisely. Be analytical and conservative in confidence scoring."
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Stage 1 Prompt
+    # ──────────────────────────────────────────────────────────────────
+
+    def _build_stage1_prompt(self, commit: AnalyzedCommit) -> str:
+        total_hunks = len(commit.ordered_hunks)
+        issue_text = commit.issue_description or "N/A"
+        hunks_display = self._format_hunks(commit.ordered_hunks)
+
+        return f"""
+## Mission
+Act as a strict quality gate. Determine whether this commit qualifies as a
+HIGH-QUALITY test set sample, then identify its core intent.
+This dataset is used for model evaluation — be strict, reject anything ambiguous.
+
+---
+
+## Input
+
+### Commit Message
+{commit.msg}
+
+### Issue Description
+{issue_text}
+
+### Candidate Hunks ({total_hunks} total — test files and comment-only hunks pre-filtered)
+{hunks_display}
+
+---
+
+## Task A — Quality Pre-Screening
+
+Check ALL six categories. Set `is_analyzable: false` if ANY single condition is met.
+
+### Category A — Formatting / Style-Only Changes
+Disqualify if the dominant change is purely cosmetic with zero semantic effect:
+- Indentation, whitespace, or blank-line normalization
+- Import statement reordering or grouping
+- Trailing whitespace / end-of-file newline cleanup
+- Quote style unification (single ↔ double), semicolon addition/removal (JS/TS)
+- Bracket / brace placement style changes, code alignment
+**Detection rule**: Strip all whitespace from each changed line pair.
+If `-` and `+` versions become identical → formatting-only hunk.
+If ALL hunks are formatting-only → disqualify.
+
+### Category B — Mechanical Rename / Mass Substitution
+Disqualify if ALL changes are fully explained by a single find-and-replace rule
+with no logic change:
+- Global rename (variable / function / class, logic unchanged)
+- Bulk import path updates caused only by file relocation
+- Magic number → named constant (behavior unchanged)
+- Spelling correction causing bulk symbol rename
+
+### Category C — Non-Code / Auto-Generated / Metadata Files
+Disqualify if non-logic files dominate the diff:
+- Version-only changes: package.json, go.mod, pom.xml, *.csproj
+- Changelog / release notes: CHANGELOG.md, HISTORY.md, RELEASE_NOTES.*
+- Lock files: package-lock.json, yarn.lock, poetry.lock, Pipfile.lock
+- Auto-generated: *.generated.*, *.pb.go, *_pb2.py, *.min.js,
+  DB migration files, GraphQL schema snapshots
+- Pure documentation: README.md, docs/** (when no logic hunk exists alongside)
+
+### Category D — Degenerate Causal Structure
+Disqualify if the causal chain is trivially simple or has no unique ground truth:
+- ALL hunks are in the same file with no cross-file propagation AND changes
+  are adjacent / sequential with no branching logic
+- ALL inter-hunk relationships are pure mechanical parameter pass-through
+  (adding a parameter at every call-stack layer, no new logic at any layer)
+- Causal order has multiple equally valid permutations (ambiguous ground truth)
+
+### Category E — Semantically Unintelligible Commits
+Disqualify if the commit's intent cannot be reliably inferred:
+- Commit Message is absent, a single generic word, or clearly unrelated to diff
+  (e.g., "fix", "update", "wip", "misc", "temp", ".", "refactor")
+- Commit Message describes multiple unrelated objectives
+- Critical hunks are truncated ("... (truncated)") and missing content is
+  essential to understanding the causal relationship
+- Diff dominated by DSL, config language, or auto-generated code whose
+  semantics cannot be inferred from syntax alone
+
+### Category F — Multi-Requirement Contamination
+Disqualify if the commit mixes independent concerns:
+- Two or more hunks fix different, unrelated bugs
+- A feature hunk is mixed with an unrelated cleanup hunk (dead code in a
+  different module, unrelated typo fix, unrelated formatting)
+- One hunk updates only version number / changelog / metadata while others
+  implement logic changes
+- A hunk is a "hitchhiker" — could be a separate commit without affecting
+  the correctness or completeness of the other hunks
+
+---
+
+## Task B — Intent Recognition
+(Only execute if `is_analyzable: true`)
+
+### B1 — Single-Requirement Coherence
+Set `is_single_requirement: true` ONLY when ALL four hold:
+1. Every hunk serves one unified intent (same bug / feature / refactoring goal)
+2. All hunks are semantically connected through causal or adaptation relationships
+   — NO isolated nodes
+3. Commit Message describes a single, coherent change objective
+4. No hunk is a "hitchhiker" (could be committed separately without breaking others)
+
+### B2 — Change Pattern Classification
+Classify into exactly one of:
+"Refactoring" | "Bug Fix" | "Enhancement" | "New Feature" | "Config Change" |
+"Refactoring+Bug Fix" | "Refactoring+Enhancement" | "Enhancement+Bug Fix" |
+"New Feature+Refactoring"
+
+### B3 — Requirement Summary
+(Only when `is_single_requirement: true`)
+ONE English sentence, ≤ 20 words. Focus on WHAT and WHY, not HOW.
+No code symbols, file names, or function names.
+✅ "Suppress redundant manual approval instructions on platforms with native approval UI."
+❌ "Modified buildExecApprovalPromptGuidance in system-prompt.ts to add a channel check."
+
+---
+
+## Output Format
+Single JSON object, no Markdown fences, no extra text.
+
+{{
+  "is_analyzable"          : <bool>,
+  "disqualification_reason": "<Category letter(s) + one-sentence evidence citing specific lines/files>" | null,
+  "is_single_requirement"  : <bool> | null,
+  "change_pattern"         : "<pattern>" | null,
+  "requirement_summary"    : "<≤20-word English sentence>" | null,
+  "reasoning": {{
+    "quality_audit"   : "<for EACH of the 6 categories: state whether it applies and cite specific evidence>",
+    "coherence_check" : "<if analyzable: evaluate each of the 4 single-requirement conditions>" | null,
+    "summary_basis"   : "<which commit message / hunk content the summary is derived from>" | null
+  }}
+}}
+"""
+
+    # ──────────────────────────────────────────────────────────────────
+    # Stage 2 Prompt
+    # ──────────────────────────────────────────────────────────────────
+
+    def _build_stage2_prompt(
+        self, commit: AnalyzedCommit, stage1: Stage1Result
     ) -> str:
-        """将依赖链对象列表转换为 LLM 易读的文本描述。"""
+        total_hunks = len(commit.ordered_hunks)
+        hunk_id_to_index = {h.id: i for i, h in enumerate(commit.ordered_hunks)}
+        dependency_text = self._format_dependency_chains(
+            commit.dependency_chains, hunk_id_to_index
+        )
+        hunks_display = self._format_hunks(commit.ordered_hunks)
+
+        return f"""
+## Mission
+A commit has passed quality screening. Reconstruct the developer's causal
+reasoning chain with precision: identify the Root Cause Hunk and model the
+modification order of all hunks.
+
+---
+
+## Pre-established Context (from Quality Gate — treat as ground truth)
+
+| Field               | Value                          |
+|---------------------|--------------------------------|
+| Requirement Summary | {stage1.requirement_summary}   |
+| Change Pattern      | {stage1.change_pattern}        |
+
+Use the Requirement Summary as your **semantic anchor** throughout the analysis.
+Every reasoning step should be grounded in this established intent.
+
+---
+
+## Input
+
+### Commit Message
+{commit.msg}
+
+### Candidate Hunks ({total_hunks} total)
+{hunks_display}
+
+### Static Dependency Information
+{dependency_text}
+
+---
+
+## Task 1 — Root Cause Hunk Identification
+
+Identify the single Root Cause Hunk — the logical origin of this change propagation.
+The Root is the hunk whose change NECESSITATES all other hunks.
+
+Given the confirmed change pattern **{stage1.change_pattern}**, apply:
+
+| Pattern              | Root Characteristics                             | Responder Characteristics              |
+|----------------------|--------------------------------------------------|----------------------------------------|
+| Refactoring          | Modifies the definition (function/class/type)    | Modifies call sites                    |
+| Bug Fix              | Corrects the core logic error                    | Adaptation changes                     |
+| Enhancement          | Extends the primary abstraction or core logic    | Interface / wiring / routing updates   |
+| New Feature          | Introduces the core new logic                    | Registration / routing / adapter hunks |
+| Config Change        | Modifies the core configuration entry            | Reader-side adaptations                |
+| Composite (X+Y)      | Prioritize the fix/enhancement intent            | Structural reorganization hunks        |
+
+#### Universal Positive Signals
+- Introduces a new symbol (function, class, constant, type) referenced by others → Root
+- Modifies an abstraction layer (interface, base class, core config) → Root
+- Semantic density asymmetry: fewer lines but higher conceptual density → likely Root
+- Most directly embodies the Requirement Summary above → Root
+
+#### Universal Elimination Rules
+- Change fully explained by another hunk's change → Responder, NOT Root
+- Removing this hunk leaves remaining hunks' intent still complete → NOT Root
+- Pure call-site adaptation (replacing old call with new) → NEVER Root
+- Pure parameter pass-through (forwarding param up/down the stack) → NEVER Root
+
+---
+
+## Task 2 — Hunk Modification Order
+
+Output an ordered list of ALL indices (0 to {total_hunks - 1}).
+
+Rules (strict priority order):
+1. Root MUST be first (position 0).
+2. Hunks directly depending on Root come next.
+3. Chain propagation priority: if B depends on Root and C depends on B,
+   order is [Root, B, C, ...] (depth-first, not breadth-first).
+4. Tie-breaking for parallel dependencies:
+   a. Same file as prior hunk → higher priority (file locality)
+   b. Within same file → ascending line number
+   c. Across files → core business logic before peripheral (CLI/routing/adapter)
+5. Every index appears exactly once — no omissions, no duplicates.
+
+---
+
+## Task 3 — Confidence Score
+
+Score strictly. Round DOWN when uncertain. Do NOT inflate.
+
+| Score      | Meaning                                                                           |
+|------------|-----------------------------------------------------------------------------------|
+| 0.9 – 1.0  | Root unique and unambiguous; full causal chain clear; ordering has one valid answer |
+| 0.75 – 0.9 | Root certain; at most one ordering uncertainty; logic coherent                    |
+| 0.6 – 0.75 | Root largely certain but one hunk has weak/indirect connection                    |
+| 0.4 – 0.6  | Two root candidates OR ordering has multiple plausible answers                    |
+| 0.0 – 0.4  | Root uncertain; causal chain cannot be reliably modeled                           |
+
+---
+
+## Output Format
+Single JSON object, no Markdown fences, no extra text.
+
+{{
+  "root_hunk_index" : <int, 0 to {total_hunks - 1}>,
+  "confidence_score": <float, 0.0 to 1.0>,
+  "change_pattern"  : "<confirm or refine Stage 1 classification if new evidence warrants>",
+  "hunk_order"      : [<int>, ...],
+  "reasoning": {{
+    "root_cause"     : "<positive evidence for Root + elimination reasoning for each non-Root hunk>",
+    "order_rationale": "<for each non-Root hunk: why at this position; tie-breaking for parallel deps>"
+  }}
+}}
+"""
+
+    # ──────────────────────────────────────────────────────────────────
+    # 共用辅助方法
+    # ──────────────────────────────────────────────────────────────────
+
+    def _format_hunks(self, hunks: list) -> str:
+        result = ""
+        for idx, hunk in enumerate(hunks):
+            lines = hunk.content.split("\n")
+            if len(lines) > self.max_diff_lines:
+                content_snippet = (
+                    "\n".join(lines[: self.max_diff_lines]) + "\n... (truncated)"
+                )
+            else:
+                content_snippet = "\n".join(lines)
+            result += f"""
+---
+[Hunk Index: {idx}]
+File: {hunk.file_path} (Lines {hunk.start_line}-{hunk.end_line})
+```diff
+{content_snippet}
+```
+"""
+        return result
+
+    def _format_dependency_chains(
+        self, chains: List[Any], hunk_id_to_index: Dict[str, int]
+    ) -> str:
         if not chains:
             return "No explicit static dependencies detected between these hunks."
-
         lines = []
         for chain in chains:
             src_idx = hunk_id_to_index.get(chain.source)
@@ -249,202 +647,47 @@ class LLMCausalRanker:
                     else str(chain.path)
                 )
                 lines.append(
-                    f"- Hunk {src_idx} depends on Hunk {tgt_idx} (Path: {path_desc})"
+                    f"- Hunk {src_idx} depends on Hunk {tgt_idx} "
+                    f"(Path: {path_desc})"
                 )
-
         return (
             "\n".join(lines)
             if lines
             else "No explicit static dependencies detected between these hunks."
         )
 
-    def _build_prompt(self, commit: AnalyzedCommit) -> str:
-        """
-        构建发送给 LLM 的 Prompt，要求 LLM 完成四项任务：
-          1. 识别根因 Hunk（Root Cause Hunk）
-          2. 判断所有 Hunks 是否协同解决同一个需求
-          3. 若是同一需求，生成简短的需求摘要
-          4. 建模其他 Hunks 的修改先后顺序（以 Root 为起点的传播链路）
-        """
-        hunk_id_to_index = {h.id: i for i, h in enumerate(commit.ordered_hunks)}
-        total_hunks = len(commit.ordered_hunks)
-        issue_text = commit.issue_description if commit.issue_description else "N/A"
-        dependency_text = self._format_dependency_chains(
-            commit.dependency_chains, hunk_id_to_index
-        )
-
-        hunks_display = ""
-        for idx, hunk in enumerate(commit.ordered_hunks):
-            lines = hunk.content.split("\n")
-            if len(lines) > self.max_diff_lines:
-                content_snippet = (
-                        "\n".join(lines[: self.max_diff_lines]) + "\n... (truncated)"
-                )
-            else:
-                content_snippet = "\n".join(lines)
-
-            hunks_display += f"""
----
-[Candidate Hunk Index: {idx}]
-File: {hunk.file_path} (Lines {hunk.start_line}-{hunk.end_line})
-Code Diff:
-```diff
-{content_snippet}
-```
-"""
-        prompt = f"""
-Goal
-Analyze the following commit and complete FOUR tasks:
-
-Identify the single "Root Cause Hunk" — the logical origin of this change propagation.
-Determine whether ALL hunks collaboratively solve ONE single requirement.
-If they do, generate a concise requirement summary in English.
-Model the modification order of ALL hunks (starting from the Root), reflecting the logical propagation sequence of the change.
-Note: All test files and comment-only changes have already been excluded from the input.
-You do not need to consider them.
-
-Context
-Commit Message
-{commit.msg}
-
-Candidate Hunks ({total_hunks} total, all production code)
-{hunks_display}
-        
-Original Diff
-{commit.source_diff}
-        
-Reasoning Guidelines
-  Task 1 — Root Cause Identification
-        Positive signals — the following features point to the Root:
-
-        New symbol definition: A hunk introduces a new function, class, constant, or type definition, while another hunk calls or references it → The definition side is the Root; the call site is a responder.
-        Pure new file/block: A hunk tagged "PURE NEW FILE/BLOCK" introduces an entirely new logical unit → If its content directly corresponds to the core intent in the Commit Message, treat it as the Root.
-        Abstraction-layer change: A hunk modifies an interface, base class, or core configuration entry → The hunk modifying the abstraction layer is the Root; implementation/adapter hunks are responders.
-        Inline logic removal + new encapsulation: One hunk removes hardcoded/inline logic, another introduces an encapsulating function → The encapsulation hunk is the Root (it embodies the core intent); the removal hunk is a responder.
-        Semantic density asymmetry: A hunk with fewer changed lines but higher semantic density (introduces a new concept or branch) is likely the Root; a hunk with many mechanical changes (bulk replacement/adaptation) is likely a responder.
-        Commit Message alignment: The hunk whose changes most directly correspond to the core intent described in the Commit Message is the Root.
-        Elimination method — the following features rule out the Root:
-
-        If a hunk's changes can be fully explained by another hunk's changes (i.e., "this had to change because that changed"), it is a responder, not the Root.
-        If removing this hunk leaves the remaining hunks' intent still complete and understandable, it is not the Root.
-        A pure call-site adaptation (e.g., replacing an old function call with a new one) is never the Root.
-        A pure parameter pass-through (e.g., forwarding a new parameter from an upper layer to a lower layer) is never the Root.
-        Root identification rules by change type:
-
-        Refactoring : The hunk modifying the function/class definition is the Root; the hunk modifying call sites is a responder.
-        Bug Fix : The hunk correcting the core logic error is the Root; adaptation changes are responders.
-        Enhancement : The hunk extending the primary abstraction or core logic is the Root; interface updates are responders.
-        New Feature : The hunk introducing the core new logic is the Root; registration/wiring/routing hunks are responders.
-        Config Change : The hunk modifying the core configuration entry is the Root; reader-side adaptations are responders.
-        Composite type : When a hunk simultaneously embodies a refactoring technique and a fix/enhancement purpose (e.g., extracting a function while introducing new branch logic), prioritize the fix/enhancement intent to locate the Root — the hunk that introduces new behavior is the Root, not the one performing only structural reorganization.
-Task 2 — Single-Requirement Coherence Check
-  Mark is_single_requirement: true ONLY when ALL of the following hold:
-
-        Every hunk serves one unified intent (same bug, same feature, same refactoring goal).
-        All hunks are semantically connected through causal or adaptation relationships (no isolated nodes).
-        The Commit Message describes a single, coherent change objective.
-        Mark is_single_requirement: false when ANY of the following is observed:
-
-        Hunks touch completely unrelated modules with no semantic causal connection between them.
-        The Commit Message lists multiple unrelated items (e.g., "fix X; also refactor Y").
-        An incidental, unrelated change is mixed in (e.g., fixing an unrelated typo or formatting while implementing a feature).
-        Multiple hunks each fix a different bug, even if all are of "Bug Fix" type.
-        A hunk only updates a version number, changelog, or metadata unrelated to the core logic.
-        Some hunks are pure whitespace or formatting changes unrelated to the core requirement.
-Task 3 — Requirement Summary
-  Generate ONLY when is_single_requirement is true; otherwise output null.
-        Language: Always write in English, regardless of the language of the Commit Message.
-        Exactly ONE sentence, no more than 20 words.
-        Focus on WHAT was changed and WHY — not HOW.
-        Avoid code symbols, file names, or variable names.
-        Good example : "Suppress redundant manual approval instructions on platforms with native approval UI."
-        Bad example : "Modified buildExecApprovalPromptGuidance in system-prompt.ts to add a channel check."
-Task 4 — Hunk Modification Order
-  Output an ordered list of ALL hunk indices (0 to {total_hunks - 1}), including the Root.
-        The Root hunk MUST appear FIRST (position 0 of the order list).
-        Order the remaining hunks by their logical dependency on prior hunks:
-        Hunks that directly depend on the Root (call a newly defined symbol, or adapt to the Root's change) come immediately after the Root.
-        Hunks that depend on the second hunk come after the second hunk, and so on (chain propagation takes priority).
-        Tie-breaking rules for parallel dependencies (when multiple hunks depend equally on the same prior hunk):
-        Prefer hunks in the same file as the prior hunk (file locality first).
-        Within the same file, order by ascending line number.
-        Across files, prefer core-module hunks (business logic) before peripheral-module hunks (CLI / routing / adapter layer).
-        Every hunk index must appear exactly once — no omissions, no duplicates.
-        Confidence Score Anchors
-        Score strictly according to the anchors below. Do not inflate scores:
-
-        Score Range	Meaning
-        0.9 – 1.0	Root is unique and unambiguous; causal chain across all hunks is clear; no isolated nodes
-        0.7 – 0.9	Root is largely certain; one parallel dependency or ordering uncertainty exists, but overall logic is coherent
-        0.5 – 0.7	Two root candidates exist, or one hunk has a weak semantic connection; inference is required
-        0.3 – 0.5	Root is uncertain; multiple hunks have ambiguous semantic relationships; ordering is difficult to determine
-        0.0 – 0.3	Hunks have almost no semantic connection; causal chain cannot be reliably modeled
-Output Format
-        Respond with a single JSON object — no Markdown fences, no extra text.
-        The reasoning field must be an object with exactly four keys,
-        each covering the reasoning process for one task:
-
-{{
-  "root_hunk_index"      : <int, 0 to {total_hunks - 1}>,
-  "confidence_score"     : <float, 0.0 to 1.0, strictly following the anchors above>,
-  "change_pattern"       : "Refactoring" | "Bug Fix" | "Enhancement" | "New Feature" | "Config Change" | "Refactoring+Bug Fix" | "Refactoring+Enhancement" | "Enhancement+Bug Fix" | "New Feature+Refactoring",
-  "is_single_requirement": <bool>,
-  "requirement_summary"  : "<one-sentence English summary, ≤ 20 words>" | null,
- "hunk_order"           : [<int>, <int>, ...],
- "reasoning": {{
- "root_cause"      : "<positive evidence + elimination reasoning: why this hunk is the Root, and why others are ruled out>",
- "coherence_check" : "<evaluate each condition for single-requirement judgment; explicitly state which conditions pass or fail and why>",
-"summary_basis"   : "<explain which information the summary is derived from: Commit Message and/or which hunk's core change>",
- "order_rationale" : "<for each non-root hunk, explain why it is placed at its current position; for parallel dependencies, state the tie-breaking rationale>"
-}}
-}}
-        """
-        return prompt
 
 # ══════════════════════════════════════════════════════════════════════════
-# Exporter
+# Exporter（保持不变）
 # ══════════════════════════════════════════════════════════════════════════
 
 class CausalDatasetExporter:
-    """
-    将分析后的 AnalyzedCommit 导出为训练/评测用的 JSONL 格式。
-    ordered_hunks[0] 为 Root（trigger_edit），其余按 hunk_order 排列为 ground_truth。
-    """
+    """将分析后的 AnalyzedCommit 导出为 JSONL 格式。"""
 
     def __init__(self, output_file: str):
         self.output_file = output_file
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
     def save_commit(self, commit: AnalyzedCommit) -> bool:
-        """
-        处理单个 Commit 并追加写入 JSONL 文件。
-        返回 True 表示成功写入，False 表示被过滤跳过。
-        """
-        # ── 基础校验 ──────────────────────────────────────────────────
         if not commit.ordered_hunks:
             logger.warning(f"Skipping {commit.hash}: No hunks.")
             return False
 
         analysis = commit.causal_analysis
 
-        # ── 过滤非单一需求 ────────────────────────────────────────────
         if analysis and not analysis.is_single_requirement:
             logger.info(f"Skipping {commit.hash[:7]}: not a single requirement.")
             return False
 
-        # ── 置信度过滤 ────────────────────────────────────────────────
         if analysis and analysis.confidence < 0.6:
             logger.info(
                 f"Skipping {commit.hash[:7]}: low confidence ({analysis.confidence:.2f})."
             )
             return False
 
-        # ── 分离 Root 和后续 Hunks ────────────────────────────────────
-        # rank_commit 已按 hunk_order 重排，ordered_hunks[0] 即为 Root
         root_hunk = commit.ordered_hunks[0]
         dependent_hunks = commit.ordered_hunks[1:]
 
-        # ── 构建各部分数据 ────────────────────────────────────────────
         trigger_data = self._process_hunk(root_hunk)
         ground_truth_list = [self._process_hunk(h) for h in dependent_hunks]
 
@@ -458,20 +701,15 @@ class CausalDatasetExporter:
                 "hunk_order": analysis.hunk_order,
             }
 
-        # ── 组装完整记录 ──────────────────────────────────────────────
         record = {
-            # 基础仓库信息
             "repo_path": commit.repo,
             "base_commit": "",
             "commit_hash": commit.hash,
-            # 需求信息
             "commit_message": commit.msg,
             "issue_description": commit.issue_description,
             "requirement_summary": analysis.requirement_summary if analysis else None,
-            # 核心数据对
             "trigger_edit": trigger_data,
             "ground_truth": ground_truth_list,
-            # LLM 分析增强信息
             "llm_analysis": llm_ana,
         }
 
@@ -479,10 +717,8 @@ class CausalDatasetExporter:
         return True
 
     def _process_hunk(self, hunk: Hunk) -> Dict[str, Any]:
-        """将 Hunk 对象转换为目标 JSON 格式。"""
         before_code, after_code = self._parse_diff_content(hunk.content)
         node_identifier = f"{hunk.file_path}:{hunk.new_start_line}"
-
         return {
             "file_path": hunk.file_path,
             "old_start_line": hunk.old_start_line,
@@ -490,16 +726,13 @@ class CausalDatasetExporter:
             "start_line": hunk.new_start_line,
             "end_line": hunk.new_start_line + hunk.new_len,
             "node_id": node_identifier,
-            "order_index": hunk.order_index,  # 在序列中的物理位置
+            "order_index": hunk.order_index,
             "before_code": before_code,
             "after_code": after_code,
         }
 
     def _parse_diff_content(self, content: str) -> tuple[str, str]:
-        """解析 Git Diff 文本，分离 before / after 代码。"""
-        before_lines = []
-        after_lines = []
-
+        before_lines, after_lines = [], []
         for line in content.split("\n"):
             if line.startswith(("---", "+++", "@@")):
                 continue
@@ -511,7 +744,6 @@ class CausalDatasetExporter:
                 clean_line = line[1:] if line.startswith(" ") else line
                 before_lines.append(clean_line)
                 after_lines.append(clean_line)
-
         return "\n".join(before_lines), "\n".join(after_lines)
 
     def _append_to_jsonl(self, data: Dict[str, Any]):
