@@ -91,80 +91,71 @@ class DiffSlicer:
         return hunks
 
     def _add_hunk(self, hunks: List[Hunk], file_path: str, meta: Dict[str, int], lines: List[str]):
-        """
-        创建 Hunk 对象。
-        逻辑：找到第一个和最后一个变更行，裁剪掉首尾的上下文。
-        """
         if not lines:
             return
 
-        # 1. 找到实际变更的起始和结束索引
-        first_change_idx = -1
-        last_change_idx = -1
+        # ── 第一阶段：预计算每行的行号偏移 ──────────────────────────────
+        old_offsets = []
+        new_offsets = []
+        old_off, new_off = 0, 0
+        for line in lines:
+            old_offsets.append(old_off)
+            new_offsets.append(new_off)
+            if line.startswith('-'):
+                old_off += 1
+            elif line.startswith('+'):
+                new_off += 1
+            elif line.startswith(' '):
+                old_off += 1
+                new_off += 1
 
+        # ── 第二阶段：识别连续变更簇 ─────────────────────────────────────
+        # 规则：连续的 +/- 行为同一簇，任何上下文行（空格）立即切断
+        clusters = []  # 每个元素: {'start_idx': int, 'lines': List[str]}
+
+        current_cluster = None
         for idx, line in enumerate(lines):
             if line.startswith('+') or line.startswith('-'):
-                if first_change_idx == -1:
-                    first_change_idx = idx
-                last_change_idx = idx
+                if current_cluster is None:
+                    # 开启新簇，记录起始索引（用于查偏移）
+                    current_cluster = {'start_idx': idx, 'lines': []}
+                current_cluster['lines'].append(line)
+            else:
+                # 上下文行或其他行：立即切断当前簇
+                if current_cluster is not None:
+                    clusters.append(current_cluster)
+                    current_cluster = None
 
-        # 如果没有发现任何变更（全是上下文，理论上不应该发生），则忽略此 Hunk
-        if first_change_idx == -1:
-            return
+        # 收尾：处理最后一个簇（diff 末尾没有上下文行的情况）
+        if current_cluster is not None:
+            clusters.append(current_cluster)
 
-        # 2. 计算首部上下文的行数偏移
-        # lines[0 : first_change_idx] 都是上下文
-        # 上下文行在旧版本和新版本中都存在，所以偏移量是一样的
-        prefix_context_count = 0
-        for i in range(first_change_idx):
-            if lines[i].startswith(' '):
-                prefix_context_count += 1
+        # ── 第三阶段：按簇生成 Hunk ──────────────────────────────────────
+        for cluster in clusters:
+            start_idx = cluster['start_idx']
+            cluster_lines = cluster['lines']
 
-        # 3. 截取有效变更区域 (Trimmed Lines)
-        # 包含从第一个变更到最后一个变更之间的所有行（包括中间夹杂的上下文）
-        trimmed_lines = lines[first_change_idx: last_change_idx + 1]
+            # 用预计算的偏移得到该簇在文件中的绝对起始行号
+            final_old_start = meta['old_start'] + old_offsets[start_idx]
+            final_new_start = meta['new_start'] + new_offsets[start_idx]
 
-        # 4. 计算有效区域内的长度
-        calc_old_len = 0
-        calc_new_len = 0
+            calc_old_len = 0
+            calc_new_len = 0
+            for line in cluster_lines:
+                if line.startswith('-'):
+                    calc_old_len += 1
+                elif line.startswith('+'):
+                    calc_new_len += 1
 
-        for line in trimmed_lines:
-            if line.startswith('-'):
-                calc_old_len += 1
-            elif line.startswith('+'):
-                calc_new_len += 1
-            elif line.startswith(' '):
-                # 中间的上下文，同时计入旧版和新版长度
-                calc_old_len += 1
-                calc_new_len += 1
-
-        # 5. 计算最终的 Start Line
-        # 原始 Start + 首部被跳过的上下文行数
-        final_old_start = meta['old_start'] + prefix_context_count
-        final_new_start = meta['new_start'] + prefix_context_count
-
-        # 6. 生成 ID (使用新版本行号)
-        hunk_id = f"{file_path}:{final_new_start}"
-
-        # 重新组合 content，只保留有效部分，或者保留全部但标记范围？
-        # 通常为了显示方便，Content 最好还是保留上下文。
-        # 但为了分析准确，Start/Len 必须是 Trim 过的。
-        # 这里我们将 content 设置为 trimmed_lines，这样 content 和 len 是对应的。
-        trimmed_content = "\n".join(trimmed_lines)
-
-        hunk = Hunk(
-            id=hunk_id,
-            file_path=file_path,
-            content=trimmed_content,  # 注意：现在的 content 不包含首尾的多余上下文
-
-            old_start_line=final_old_start,
-            old_len=calc_old_len,
-
-            new_start_line=final_new_start,
-            new_len=calc_new_len,
-
-            # 兼容字段
-            start_line=final_new_start,
-            end_line=final_new_start + calc_new_len - 1 if calc_new_len > 0 else final_new_start
-        )
-        hunks.append(hunk)
+            hunk = Hunk(
+                id=f"{file_path}:{final_new_start}",
+                file_path=file_path,
+                content="\n".join(cluster_lines),
+                old_start_line=final_old_start,
+                old_len=calc_old_len,
+                new_start_line=final_new_start,
+                new_len=calc_new_len,
+                start_line=final_new_start,
+                end_line=final_new_start + calc_new_len - 1 if calc_new_len > 0 else final_new_start
+            )
+            hunks.append(hunk)

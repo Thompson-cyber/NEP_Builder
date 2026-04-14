@@ -28,11 +28,11 @@ OUTPUT_BASE = "/home/data/yibowang/multi_completion_datas/data_collection/"
 
 REPOS = {
     "Python": [
-        "transformers",
-        "django",
-        "fastapi",
-        "core",
-        "sherlock",
+        # "transformers",
+        # "django",
+        # "fastapi",
+        # "core",
+        # "sherlock",
         "yt-dlp",
         "ComfyUI",
         "pytorch",

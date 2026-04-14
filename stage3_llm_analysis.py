@@ -2,6 +2,8 @@ import argparse
 import json
 import os
 import time
+from datetime import date
+
 from loguru import logger
 from tqdm import tqdm
 
@@ -14,14 +16,18 @@ from config.settings import MiningConfig
 def parse_args():
     p = argparse.ArgumentParser(description="NEP Pipeline — Phase 3: LLM Causal Ranking")
     p.add_argument("--input",     required=True,  help="Phase 2 output (analyzed.jsonl)")
-    p.add_argument("--old_format_output", required=True, help="Old format dataset output path (.jsonl)")
-    p.add_argument("--output",    required=True,  help="Final dataset output path (.jsonl)")
-    p.add_argument("--error_log", default="output/llm_failures.jsonl", help="Path for failed items")
+    p.add_argument("--output",    required=True,  help="Final dataset output path")
+    p.add_argument("--repo-name", required=True, help="repo-name")
+
     return p.parse_args()
 
 
 def main():
     args   = parse_args()
+    today = date.today().strftime('%Y-%m-%d')
+    filter_out_path = os.path.join(args.output, f"{args.repo_name}_{today}_phase3_filtered.jsonl")
+    error_log_path = os.path.join(args.output, f"{args.repo_name}_{today}_phase3_errors.log")
+    output_path = os.path.join(args.output, f"{args.repo_name}_{today}_phase3_results.jsonl")
 
     # 初始化配置和 Ranker
     config = MiningConfig()
@@ -31,13 +37,13 @@ def main():
 
     try:
         ranker = LLMCausalRanker(config)
-        exporter = CausalDatasetExporter(output_file=args.output)
+        exporter = CausalDatasetExporter(output_file=output_path)
 
     except Exception as e:
         logger.critical(f"Failed to initialize LLM Ranker: {e}")
         return
 
-    os.makedirs(os.path.dirname(args.old_format_output), exist_ok=True)
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
     stats = {
         "total_input": 0,
@@ -49,11 +55,10 @@ def main():
 
     start_time = time.time()
     logger.info(f"Starting LLM Ranking. Reading from {args.input}")
-
     try:
         with open(args.input, 'r', encoding='utf-8') as f_in, \
-                open(args.old_format_output, 'w', encoding='utf-8') as f_out, \
-                open(args.error_log, 'w', encoding='utf-8') as f_err:
+                open(filter_out_path, 'w', encoding='utf-8') as f_out, \
+                open(error_log_path, 'w', encoding='utf-8') as f_err:
 
             for line in tqdm(f_in, desc="LLM Ranking"):
                 if not line.strip(): continue
@@ -112,7 +117,7 @@ def main():
         Time Elapsed     : {stats['time_elapsed']:.1f}s
         Avg Time/Item    : {stats['time_elapsed'] / stats['success'] if stats['success'] else 0:.2f}s
         ==================================================
-        Failed items saved to: {args.error_log}
+        Failed items saved to: {error_log_path}
     """
     logger.success(report)
 

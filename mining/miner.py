@@ -49,8 +49,8 @@ class RepoMiner:
                     f"| commit={commit.hash[:7]} "
                     f"| 已跳过，继续下一个"
                 )
-                continue  # ← 核心：跳过这个 commit，不终止整个迭代
-
+                # continue
+                break
         logger.info(
             f"[{self.repo_name}] Mining 完成 | "
             f"total={stats['total']} "
