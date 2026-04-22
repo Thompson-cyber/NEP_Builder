@@ -23,55 +23,40 @@ from stage1_collect_commits import run_phase1
 from stage2_call_graph_analysis import run_phase2
 
 # ── 仓库列表 ──────────────────────────────────────────────────────────────────
-REPOS_BASE = r"D:\Data\2025\CodeCompletion\Dataset\Repos\all_repos\repos"
-OUTPUT_BASE = r"D:\Data\2025\CodeCompletion\Dataset\Outputs\re_collected_phase1&2"
+REPOS_BASE = r"D:\Data\2025\CodeCompletion\Dataset\Repos\train_repos\repos"
+OUTPUT_BASE = r"D:\Data\2025\CodeCompletion\Dataset\trainOutputs"
 
 REPOS = {
     "Python": [
-        # "transformers",
-        # "django",
-        "fastapi",
-        "core",
-        "sherlock",
-        "yt-dlp",
-        "ComfyUI",
-        # "pytorch",
+        "superset",
+        "flask",
+        "ansible",
+        "OpenBB",
+        "localstack",
+        "keras",
+        "pathway",
     ],
     "Go": [
-        "ollama",
-        "kubernetes",
-        "frp",
-        "gin",
-        "hugo",
-        "syncthing",
-        "fzf",
-        "caddy",
-        "moby",
-        "traefik",
+        "minio",
+        "memos",
+        "rclone",
+        "gitea",
+        "etcd",
+
     ],
     "Java": [
-        "spring-boot",
-        # "elasticsearch",
-        # "guava",
-        "dbeaver",
-        "RxJava",
-        "jadx",
-        "dubbo",
-        "MPAndroidChart",
-        "arthas",
-        "selenium",
+        "zxing",
+        "kafka",
+        "conductor",
+        "hutool",
+        "xxl-job",
     ],
     "TypeScript": [
-        "ant-design",
-        "immich",
-        "storybook",
-        "mermaid",
-        "nest",
-        "strapi",
-        "n8n",
-        # "ionic-framework",
-        "Flowise",
-        "DefinitelyTyped",
+        "query",
+        "expo",
+        "prisma",
+        "react-hook-form",
+        "twenty",
     ],
 }
 

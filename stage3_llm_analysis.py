@@ -52,7 +52,13 @@ def main():
         "tokens_used": 0,  # 如果你的 Ranker 返回 token 使用情况的话
         "time_elapsed": 0
     }
-
+    analyzed_content = ''
+    if os.path.exists(filter_out_path):
+        with open(filter_out_path, "r",encoding='utf-8') as f:
+            analyzed_content = f.read()
+    if os.path.exists(error_log_path):
+        with open(error_log_path, "r",encoding='utf-8') as f:
+            analyzed_content += f.read()
     start_time = time.time()
     logger.info(f"Starting LLM Ranking. Reading from {args.input}")
     try:
@@ -67,7 +73,9 @@ def main():
                 try:
                     data = json.loads(line)
                     commit = AnalyzedCommit(**data)
-
+                    if commit.hash in analyzed_content:
+                        stats["success"] += 1
+                        continue
                     # 检查是否已经包含 ranking
                     if commit.causal_analysis:
                         f_out.write(line)
@@ -77,6 +85,8 @@ def main():
                     # === 核心调用 ===
                     # rank_commit 会修改 commit 对象的 ordered_hunks 顺序并填充 causal_analysis
                     ranked_commit = ranker.rank_commit(commit)
+                    if ranked_commit is None:
+                        continue
                     # ranked_commit = commit
                     exporter.save_commit(ranked_commit)
 
