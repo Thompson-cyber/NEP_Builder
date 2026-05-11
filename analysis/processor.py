@@ -32,7 +32,7 @@ class CoChangeValidator:
 
 
 class CommitProcessor:
-    def __init__(self, repo_path: str, use_graph: bool = True):
+    def __init__(self, repo_path: str, use_graph: bool = False):
         self.slicer = DiffSlicer()
         self.graph_sorter = DependencyGraph()
         self.validator = CoChangeValidator()

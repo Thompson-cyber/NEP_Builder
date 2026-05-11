@@ -11,11 +11,10 @@ python run_pipeline.py \
     --repo /path/to/repo \
     --repo_name pandas 
 
-# ② 完整跑，禁用图分析
+# ② 完整跑（图分析已完全禁用）
 python run_pipeline.py \
     --repo /path/to/repo \
-    --repo_name pandas \
-    --no-graph
+    --repo_name pandas
 
 # ③ Phase1 已跑过，只重跑 Phase2
 python run_pipeline.py \
@@ -48,7 +47,6 @@ def parse_args():
 
     # ── Phase 2 参数 ──────────────────────────────────
     p.add_argument("--reset",     action="store_true", help="忽略 Phase2 断点，从头重跑")
-    p.add_argument("--no-graph",  action="store_true", help="禁用图分析，走 LLM-filter 模式")
 
     # ── 跳过控制 ──────────────────────────────────────
     p.add_argument("--skip-phase1", action="store_true",
@@ -61,7 +59,7 @@ def main():
     args = parse_args()
     from datetime import date
     today = date.today().strftime('%Y-%m-%d')
-    mode = "no_graph" if args.no_graph else "graph"
+    mode = "no_graph"
 
     candidates_path = os.path.join(args.output_dir, f"{args.repo_name}_{today}_phase1_candidates.jsonl")
     analyzed_path = os.path.join(args.output_dir, f"{args.repo_name}_{today}_phase2_{mode}.jsonl")
@@ -109,7 +107,7 @@ def main():
         repo_path=args.repo,
         repo_name=args.repo_name,
         reset=args.reset,
-        use_graph=not args.no_graph,
+        use_graph=False,
     )
 
     # ── 最终汇总 ──────────────────────────────────────

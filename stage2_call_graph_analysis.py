@@ -11,7 +11,7 @@ from core.types import CommitCandidate
 from analysis.processor import CommitProcessor
 
 def _checkpoint_filename(repo_name: str, use_graph: bool) -> str:
-    mode = "graph" if use_graph else "no_graph"
+    mode = "no_graph"
     return f"{repo_name}_phase2_{mode}_checkpoint.json"
 
 def _checkpoint_path(output_dir: str, repo_name: str, use_graph: bool) -> str:
@@ -105,7 +105,7 @@ def _empty_stats() -> Dict[str, Any]:
         "total_input": 0,
         "total_output": 0,
         "errors": 0,
-        "no_graph_mode": False,
+        "no_graph_mode": True,
         "filters": {
             "missing_source": 0, "slicing_error": 0, "slicing_empty": 0,
             "too_few_hunks": 0, "too_many_hunks": 0, "no_dependency": 0,
@@ -153,7 +153,7 @@ def _print_report(stats: Dict[str, Any]) -> None:
     success_count = stats["total_output"]
     avg_hunks = stats["insights"]["total_hunks"] / success_count if success_count else 0
     avg_deps  = stats["insights"]["total_dependencies"] / success_count if success_count else 0
-    mode_str  = "NO-GRAPH (LLM-filter)" if stats.get("no_graph_mode") else "GRAPH"
+    mode_str  = "NO-GRAPH (LLM-filter)"
 
     report = f"""
 ==================================================
@@ -199,10 +199,10 @@ def run_phase2(
     repo_path: str,
     repo_name: str,
     reset: bool = False,
-    use_graph: bool = True,
+    use_graph: bool = False,
 ) -> Dict[str, Any]:
     from datetime import date
-    mode = "graph" if use_graph else "no_graph"
+    mode = "no_graph"
     output = output or f"output/{repo_name}_{date.today().strftime('%Y-%m-%d')}_phase2_{mode}.jsonl"
 
     """
@@ -319,12 +319,6 @@ def parse_args():
     p.add_argument("--repo_name", required=True, help="仓库短标识符，用于命名输出文件")
     p.add_argument("--output", default=None, help="Output JSONL file path (default: auto-named)")
     p.add_argument("--reset",     action="store_true", help="Ignore checkpoint and restart from scratch")
-    p.add_argument(
-        "--no-graph",
-        action="store_true",
-        default=False,
-        help="禁用 GraphDependencyAnalyzerWrapper，跳过依赖分析，供后续 LLM 过滤使用。"
-    )
     return p.parse_args()
 
 
@@ -336,6 +330,6 @@ def main():
         repo_path=args.repo_path,
         repo_name=args.repo_name,
         reset=args.reset,
-        use_graph=not args.no_graph,
+        use_graph=False,
     )
 

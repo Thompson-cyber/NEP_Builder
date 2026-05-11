@@ -3,7 +3,7 @@
 批量对多个仓库运行 NEP Pipeline
 用法：
     python batch_run.py                        # 全量跑
-    python batch_run.py --no-graph             # 禁用图分析
+    python batch_run.py                        # 默认禁用图分析
     python batch_run.py --skip-phase1          # 跳过 Phase1
     python batch_run.py --reset                # Phase2 忽略断点
     python batch_run.py --lang Python          # 只跑某个语言
@@ -68,7 +68,6 @@ def parse_args():
     p.add_argument("--output-base", default=OUTPUT_BASE, help="输出根目录")
     p.add_argument("--lang",        default=None,        help="只跑指定语言 (Python/Go/Java/TypeScript)")
     p.add_argument("--repo-name",   default=None,        help="只跑指定仓库名")
-    p.add_argument("--no-graph",    action="store_true", help="禁用图分析")
     p.add_argument("--skip-phase1", action="store_true", help="跳过 Phase1")
     p.add_argument("--reset",       action="store_true", help="Phase2 忽略断点重跑")
     return p.parse_args()
@@ -77,7 +76,7 @@ def parse_args():
 # ── 单仓库运行 ────────────────────────────────────────────────────────────────
 def run_one(repo_name: str, lang: str, args) -> dict:
     today = date.today().strftime('%Y-%m-%d')
-    mode  = "no_graph" if args.no_graph else "graph"
+    mode  = "no_graph"
 
     repo_path    = os.path.join(args.repos_base, lang, repo_name)
     output_dir   = os.path.join(args.output_base, lang, repo_name)
@@ -117,7 +116,7 @@ def run_one(repo_name: str, lang: str, args) -> dict:
         repo_path=repo_path,
         repo_name=repo_name,
         reset=args.reset,
-        use_graph=not args.no_graph,
+        use_graph=False,
     )
 
     total = stats.get("total_output", "?")
@@ -147,7 +146,7 @@ def main():
     logger.info(f"  共 {total} 个仓库待处理")
     logger.info(f"  repos_base  : {args.repos_base}")
     logger.info(f"  output_base : {args.output_base}")
-    logger.info(f"  mode        : {'no_graph' if args.no_graph else 'graph'}")
+    logger.info(f"  mode        : no_graph")
     logger.info(f"{'='*60}\n")
 
     results = []

@@ -5,7 +5,7 @@ load_dotenv()
 class MiningConfig:
     # --- 阈值设置 (仅针对 Source Files) ---
     # --- 源文件扩展名 ---
-    SOURCE_EXTENSIONS = [".py", ".java", ".ts",".tsx",".go",".js",".cjs",".mjs",".jsx"]
+    SOURCE_EXTENSIONS = [".py", ".java", ".ts", ".tsx", ".go", ".js", ".cjs", ".mjs", ".jsx", ".rs", ".c", ".cpp", ".cxx", ".cc", ".hpp"]
 
     # --- 测试文件模式 ---
     TEST_FILE_PATTERNS = ["test","test_", "_test.py", "tests/","tests", ".spec.ts", ".test.ts"]  # 添加 Java 和 TS 测试文件模式
@@ -21,14 +21,14 @@ class MiningConfig:
         MAX_SOURCE_HUNKS = 1
     else:
         # 我们只关心功能代码的规模
-        MIN_SOURCE_LOC = 3  # 至少改了5行功能代码
-        MAX_SOURCE_LOC = 20  # 功能代码变动不宜过大
+        MIN_SOURCE_LOC = 5  # 至少改了5行功能代码
+        MAX_SOURCE_LOC = 50  # 功能代码变动不宜过大
 
         MIN_SOURCE_FILES = 1  # 至少改动1个功能文件
-        MAX_SOURCE_FILES = 5  # 一次 Feature 不应修改太多功能文件
+        MAX_SOURCE_FILES = 10  # 一次 Feature 不应修改太多功能文件
 
         MIN_SOURCE_HUNKS = 2  # 只有1个Hunk无法构建排序任务，直接丢弃
-        MAX_SOURCE_HUNKS = 5
+        MAX_SOURCE_HUNKS = 10
     REQUIRE_DEPENDENCY = True # 是否必须存在显式的 Def-Use 依赖链
     ALLOW_CYCLES = True      # 是否允许存在依赖环路（通常环路意味着逻辑复杂或提取错误）
     NO_ISOLATED_HUNKS = True

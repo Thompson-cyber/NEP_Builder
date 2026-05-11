@@ -36,8 +36,8 @@ class RelevantCodeFilter(BaseFilter):
                     break
 
             # 2. 检查是否是有效源码
-            # 条件：是 .py 结尾 + 不是测试文件 + 不是黑名单文件
-            if fname.endswith('.py') and not is_current_file_test:
+            # 条件：是源码扩展名 + 不是测试文件 + 不是黑名单文件
+            if any(fname.endswith(ext) for ext in config.SOURCE_EXTENSIONS) and not is_current_file_test:
                 is_ignored = False
                 for ignore_pattern in config.IGNORE_FILES:
                     if ignore_pattern in fname:
@@ -64,19 +64,19 @@ class SizeFilter(BaseFilter):
     """
 
     def check(self, commit: Commit, config: MiningConfig) -> bool:
-        # 筛选出所有 Python 文件 (包括测试)
-        py_files = [
+        # 筛选出所有源码文件（包括测试）
+        source_files = [
             f for f in commit.modified_files
-            if f.filename.endswith('.py')
+            if any(f.filename.lower().endswith(ext) for ext in config.SOURCE_EXTENSIONS)
         ]
 
         # 检查文件数量
-        if not (config.MIN_MODIFIED_FILES <= len(py_files) <= config.MAX_MODIFIED_FILES):
+        if not (config.MIN_MODIFIED_FILES <= len(source_files) <= config.MAX_MODIFIED_FILES):
             return False
 
-        # 检查代码行数变动 (只计算 Python 文件)
+        # 检查代码行数变动（只计算源码文件）
         total_change = 0
-        for f in py_files:
+        for f in source_files:
             total_change += (f.added_lines + f.deleted_lines)
 
         if not (config.MIN_LOC_CHANGE <= total_change <= config.MAX_LOC_CHANGE):
